@@ -9,10 +9,11 @@ Design spec (Section 9):
   4. Disagreement penalty — if strategies strongly conflict, reduce score by 15%
   5. Deduplication penalty — if same stock signalled previous N days, reduce score
   6. Final signal classification via score thresholds (STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL)
-  7. Persist fused signal to signals table in DB
+  7. Persist fused signal to daily_signals table in DB
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Dict, List, Optional
@@ -25,11 +26,11 @@ from app.strategies.base import StrategyResult, score_to_signal
 logger = get_logger("fusion")
 
 # ── Thresholds (Section 9) ────────────────────────────────────
-MIN_CONFIDENCE      = 20.0   # strategies below this are excluded from fusion
-AGREEMENT_BONUS     = 10.0   # score bonus when 3+ strategies agree on direction
-DISAGREEMENT_PENALTY= 15.0   # score reduction when strategies strongly conflict
-DEDUP_LOOKBACK_DAYS = 3      # days to look back for duplicate signals
-DEDUP_PENALTY       = 12.0   # score penalty per recent duplicate
+MIN_CONFIDENCE       = 20.0   # strategies below this are excluded from fusion
+AGREEMENT_BONUS      = 10.0   # score bonus when all strategies agree on direction
+DISAGREEMENT_PENALTY = 15.0   # score reduction when strategies strongly conflict
+DEDUP_LOOKBACK_DAYS  = 3      # days to look back for duplicate signals
+DEDUP_PENALTY        = 12.0   # score penalty per recent duplicate
 
 # Strategy ID → regime weight key mapping
 STRATEGY_WEIGHT_KEY: Dict[str, str] = {
@@ -47,7 +48,7 @@ class FusedSignal:
     run_date: date
     fused_score: float                   # -100 to +100
     signal: str                          # STRONG_BUY | BUY | HOLD | SELL | STRONG_SELL
-    confidence: float                    # 0–100 (weighted avg of participating strategies)
+    confidence: float                    # 0-100 (weighted avg of participating strategies)
     regime: str
     strategy_scores: Dict[str, float] = field(default_factory=dict)
     strategy_signals: Dict[str, str]  = field(default_factory=dict)
@@ -57,9 +58,8 @@ class FusedSignal:
     dedup_penalty: float = 0.0
     recent_signal_days: int = 0
     reasons: List[str] = field(default_factory=list)
-    # Price levels from highest-confidence strategy
-    entry_price: Optional[float] = None
-    stop_loss:   Optional[float] = None
+    entry_price:  Optional[float] = None
+    stop_loss:    Optional[float] = None
     target_price: Optional[float] = None
 
     def to_dict(self) -> Dict:
@@ -95,8 +95,8 @@ def _get_recent_signal_count(symbol: str, run_date: date, lookback: int) -> int:
             cursor.execute(
                 """
                 SELECT COUNT(*) as cnt
-                FROM signals
-                WHERE symbol = %s
+                FROM daily_signals
+                WHERE stock = %s
                   AND date > %s
                   AND date < %s
                   AND signal IN ('BUY', 'STRONG_BUY')
@@ -111,50 +111,59 @@ def _get_recent_signal_count(symbol: str, run_date: date, lookback: int) -> int:
 
 
 def _save_signal(signal: FusedSignal) -> None:
-    """Upsert fused signal into signals table."""
+    """Upsert fused signal into daily_signals table."""
     try:
         with get_sync_db() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO signals (
-                    symbol, date, signal, fused_score, confidence,
-                    regime, entry_price, stop_loss, target_price,
-                    strategy_scores, fusion_weights, reasons
+                INSERT INTO daily_signals (
+                    stock, date, signal, quant_score, confidence_pct,
+                    regime,
+                    entry_price_theoretical, stop_loss_theoretical, exit_target_theoretical,
+                    trend_score, momentum_score, reversion_score, breakout_score, volume_score,
+                    llm_override, valid_until
                 ) VALUES (
+                    %s, %s, %s::signal_type, %s, %s,
+                    %s::regime_type,
+                    %s, %s, %s,
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
-                    %s::jsonb, %s::jsonb, %s
+                    'NONE', %s
                 )
-                ON CONFLICT (symbol, date) DO UPDATE SET
-                    signal          = EXCLUDED.signal,
-                    fused_score     = EXCLUDED.fused_score,
-                    confidence      = EXCLUDED.confidence,
-                    regime          = EXCLUDED.regime,
-                    entry_price     = EXCLUDED.entry_price,
-                    stop_loss       = EXCLUDED.stop_loss,
-                    target_price    = EXCLUDED.target_price,
-                    strategy_scores = EXCLUDED.strategy_scores,
-                    fusion_weights  = EXCLUDED.fusion_weights,
-                    reasons         = EXCLUDED.reasons
+                ON CONFLICT (date, stock) DO UPDATE SET
+                    signal                  = EXCLUDED.signal,
+                    quant_score             = EXCLUDED.quant_score,
+                    confidence_pct          = EXCLUDED.confidence_pct,
+                    regime                  = EXCLUDED.regime,
+                    entry_price_theoretical = EXCLUDED.entry_price_theoretical,
+                    stop_loss_theoretical   = EXCLUDED.stop_loss_theoretical,
+                    exit_target_theoretical = EXCLUDED.exit_target_theoretical,
+                    trend_score             = EXCLUDED.trend_score,
+                    momentum_score          = EXCLUDED.momentum_score,
+                    reversion_score         = EXCLUDED.reversion_score,
+                    breakout_score          = EXCLUDED.breakout_score,
+                    volume_score            = EXCLUDED.volume_score
                 """,
                 (
                     signal.symbol,
                     signal.run_date,
                     signal.signal,
-                    round(signal.fused_score, 4),
-                    round(signal.confidence, 4),
+                    round(signal.fused_score, 2),
+                    round(signal.confidence, 2),
                     signal.regime,
                     signal.entry_price,
                     signal.stop_loss,
                     signal.target_price,
-                    __import__("json").dumps(signal.strategy_scores),
-                    __import__("json").dumps(signal.fusion_weights_used),
-                    "\n".join(signal.reasons),
+                    round(signal.strategy_scores.get("trend",     0.0), 2),
+                    round(signal.strategy_scores.get("momentum",  0.0), 2),
+                    round(signal.strategy_scores.get("reversion", 0.0), 2),
+                    round(signal.strategy_scores.get("breakout",  0.0), 2),
+                    round(signal.strategy_scores.get("volume",    0.0), 2),
+                    signal.run_date,   # valid_until = same day; pipeline updates this later
                 ),
             )
     except Exception as e:
-        logger.error(f"Failed to save signal for {symbol}: {e}")
+        logger.error(f"Failed to save signal for {signal.symbol}: {e}")
 
 
 # ── Core fusion logic ─────────────────────────────────────────
@@ -200,8 +209,8 @@ def fuse(
     weighted_score  = 0.0
     total_weight    = 0.0
     weighted_conf   = 0.0
-    strategy_scores = {}
-    strategy_signals= {}
+    strategy_scores: Dict[str, float] = {}
+    strategy_signals: Dict[str, str]  = {}
 
     for r in eligible:
         wkey   = STRATEGY_WEIGHT_KEY.get(r.strategy_id, "trend")
@@ -212,7 +221,6 @@ def fuse(
         strategy_scores[r.strategy_id]  = r.score
         strategy_signals[r.strategy_id] = r.signal
 
-    # Normalise by actual weight used (in case some strategies skipped)
     if total_weight > 0:
         fused_score = weighted_score / total_weight
         confidence  = weighted_conf  / total_weight
@@ -226,7 +234,6 @@ def fuse(
     )
 
     # ── 3a. Agreement bonus ───────────────────────────────────
-    # Count BUY-side vs SELL-side signals among eligible strategies
     buy_side  = sum(1 for r in eligible if r.score > 0)
     sell_side = sum(1 for r in eligible if r.score < 0)
     n         = len(eligible)
@@ -254,11 +261,10 @@ def fuse(
             f"{buy_side} bullish vs {sell_side} bearish strategies"
         )
 
-    # Clamp to [-100, 100]
     fused_score = max(-100.0, min(100.0, fused_score))
 
     # ── 4. Deduplication penalty ──────────────────────────────
-    recent_days  = _get_recent_signal_count(symbol, run_date, DEDUP_LOOKBACK_DAYS)
+    recent_days   = _get_recent_signal_count(symbol, run_date, DEDUP_LOOKBACK_DAYS)
     dedup_penalty = 0.0
     if recent_days > 0 and fused_score > 0:
         dedup_penalty = DEDUP_PENALTY * recent_days
@@ -271,8 +277,7 @@ def fuse(
     # ── 5. Final signal label + price levels ─────────────────
     signal = score_to_signal(fused_score)
 
-    # Price levels: use the strategy with highest confidence
-    best = max(eligible, key=lambda r: r.confidence)
+    best         = max(eligible, key=lambda r: r.confidence)
     entry_price  = best.entry_price
     stop_loss    = best.stop_loss
     target_price = best.target_price
@@ -328,7 +333,7 @@ class FusionEngine:
         save_to_db: bool = True,
     ) -> List[FusedSignal]:
         """
-        all_results: { symbol → [StrategyResult, ...] }
+        all_results: { symbol -> [StrategyResult, ...] }
         Returns list of FusedSignals sorted by fused_score descending.
         """
         fused = []
@@ -345,7 +350,6 @@ class FusionEngine:
             except Exception as e:
                 logger.error(f"Fusion failed for {symbol}: {e}")
 
-        # Sort: STRONG_BUY → BUY first, then by score descending
         priority = {"STRONG_BUY": 0, "BUY": 1, "HOLD": 2, "SELL": 3, "STRONG_SELL": 4}
         fused.sort(key=lambda f: (priority.get(f.signal, 5), -f.fused_score))
 

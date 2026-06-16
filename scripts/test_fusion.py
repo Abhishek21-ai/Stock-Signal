@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datetime import date
 from app.strategies.base import StrategyResult
 from app.regime.detector import RegimeResult, REGIME_WEIGHTS
-from app.signals.engine import fuse, FusionEngine, AGREEMENT_BONUS, DISAGREEMENT_PENALTY
+from app.fusion.engine import fuse, FusionEngine, AGREEMENT_BONUS, DISAGREEMENT_PENALTY
 
 
 # ── Helpers ───────────────────────────────────────────────────
