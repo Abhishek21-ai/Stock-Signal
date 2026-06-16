@@ -34,7 +34,7 @@ def test_classification_logic():
         # (close, ema20, ema50, ema200, adx, expected)
         (22000, 21900, 21700, 21000, 28.0, "BULL"),
         (19000, 19200, 19500, 20000, 30.0, "BEAR"),
-        (22000, 22010, 21990, 21500, 17.0, "SIDEWAYS"),
+        (22000, 22050, 22100, 21800, 17.0, "SIDEWAYS"),  # mixed EMAs (20<50), weak ADX, price near EMA20
         (22000, 21900, 21700, 21000, 18.0, "UNCERTAIN"),  # bull align but weak ADX
     ]
 
