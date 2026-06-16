@@ -103,10 +103,14 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["atr_pct"] = df["atr_14"] / df["Close"] * 100
 
     # ── Volatility: Bollinger Bands ──────────────────────────
+    # Column names vary by pandas_ta version — detect dynamically
     bb = ta.bbands(df["Close"], length=20, std=2)
-    df["bb_upper"] = bb["BBU_20_2.0"]
-    df["bb_mid"]   = bb["BBM_20_2.0"]
-    df["bb_lower"] = bb["BBL_20_2.0"]
+    bb_upper_col = [c for c in bb.columns if c.startswith("BBU")][0]
+    bb_mid_col   = [c for c in bb.columns if c.startswith("BBM")][0]
+    bb_lower_col = [c for c in bb.columns if c.startswith("BBL")][0]
+    df["bb_upper"] = bb[bb_upper_col]
+    df["bb_mid"]   = bb[bb_mid_col]
+    df["bb_lower"] = bb[bb_lower_col]
     df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
 
     # %B: where price sits within the band (0=lower, 1=upper)
