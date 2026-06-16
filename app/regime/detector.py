@@ -132,12 +132,17 @@ def classify_regime(
         reasons.append(f"ADX={adx:.1f} > 25 — trend is strong")
         return "BEAR", reasons
 
-    # ── Sideways: weak trend + price near 20-day mean ─────────
+    # ── Sideways: weak trend + no EMA directional bias ───────
+    # EMAs must NOT be in full bull or bear alignment.
+    # If EMAs are aligned (e.g. EMA20>EMA50>EMA200) but ADX is weak,
+    # that's UNCERTAIN (transitional), not SIDEWAYS.
+    ema_aligned = (ema20 > ema50 > ema200) or (ema20 < ema50 < ema200)
     mean_20 = ema20    # EMA20 ≈ 20-day mean for this check
     price_dev = abs(close - mean_20) / mean_20 if mean_20 > 0 else 1.0
-    if adx < 20 and price_dev <= 0.015:
+    if adx < 20 and price_dev <= 0.015 and not ema_aligned:
         reasons.append(f"ADX={adx:.1f} < 20 — no clear trend")
         reasons.append(f"Price {price_dev:.2%} from EMA20 — ranging market")
+        reasons.append("EMAs not directionally aligned — confirmed sideways")
         return "SIDEWAYS", reasons
 
     # ── Uncertain: transitional / partial alignment ────────────
