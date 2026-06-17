@@ -1,5 +1,5 @@
 """
-Strategy Runner — executes all 5 strategies and returns results.
+Strategy Runner — executes all 6 strategies and returns results.
 Called by pipeline.py Stage 4.
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ from app.strategies.momentum import MomentumStrategy
 from app.strategies.reversion import MeanReversionStrategy
 from app.strategies.breakout import BreakoutStrategy
 from app.strategies.volume import VolumeProfileStrategy
+from app.strategies.risk import RiskStrategy
 from app.logger import get_logger
 
 logger = get_logger("strategy_runner")
@@ -22,6 +23,7 @@ ALL_STRATEGIES = [
     MeanReversionStrategy(),
     BreakoutStrategy(),
     VolumeProfileStrategy(),
+    RiskStrategy(),
 ]
 
 
