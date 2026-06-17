@@ -5,6 +5,7 @@
 Production-ready decision-support system for Indian equities (NSE/BSE) that combines quantitative trading algorithms, market-regime detection, risk management, portfolio controls, and LLM-assisted explainability.
 
 **Version:** 1.0.0
+
 **Status:** Production-Ready Architecture  
 **Market:** Indian Equity Markets (NSE/BSE)
 
