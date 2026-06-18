@@ -286,6 +286,7 @@ class DailyPipeline:
         Replaces the simple position count cap.
         """
         from app.portfolio.manager import PortfolioManager
+        from app.trades.lifecycle import create_pending_trades
 
         def _run():
             manager = PortfolioManager(
@@ -300,6 +301,9 @@ class DailyPipeline:
         self.ctx.signals_generated = len(
             [s for s in result.accepted if "BUY" in s.signal]
         )
+
+        # Create PENDING trade rows for accepted BUY signals
+        create_pending_trades(result.accepted, self.ctx.run_date)
 
         if result.rejected:
             logger.info(
