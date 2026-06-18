@@ -279,29 +279,43 @@ class DailyPipeline:
         logger.info("Execution realism: applied to all BUY/SELL signals")
 
     # ── Stage 9: Portfolio Constraints ───────────────────────
-
     async def _run_portfolio(self) -> None:
         """
-        Applies position sizing and portfolio-level caps.
-        Section 21: max 8 open positions, 30% sector cap, 15% single stock cap.
-        Full portfolio manager: app/portfolio/manager.py (next build layer).
-        For now: enforce max open positions by score rank.
+        Section 21: Full portfolio management — position sizing,
+        sector caps, total risk cap, signal prioritization.
+        Replaces the simple position count cap.
         """
-        buy_signals = [s for s in self.ctx.fused_signals if "BUY" in s.signal]
-        buy_signals.sort(key=lambda s: s.fused_score, reverse=True)
+        from app.portfolio.manager import PortfolioManager
+        from app.trades.lifecycle import create_pending_trades
 
-        # Cap at max_open_positions
-        allowed = settings.max_open_positions
-        for i, signal in enumerate(buy_signals):
-            if i >= allowed:
-                signal.signal    = "HOLD"
-                signal.fused_score = 0.0
-                signal.reasons.append(
-                    f"Portfolio cap: max {allowed} positions reached — signal deferred"
-                )
+        def _run():
+            manager = PortfolioManager(
+                run_date=self.ctx.run_date,
+                features_map=self.ctx.features,
+            )
+            return manager.run(self.ctx.fused_signals)
 
-        active_buys = sum(1 for s in self.ctx.fused_signals if "BUY" in s.signal)
-        logger.info(f"Portfolio: {active_buys} BUY signals within position cap={allowed}")
+        result = await asyncio.get_event_loop().run_in_executor(None, _run)
+
+        self.ctx.final_signals    = result.accepted
+        self.ctx.signals_generated = len(
+            [s for s in result.accepted if "BUY" in s.signal]
+        )
+
+        # Create PENDING trade rows for accepted BUY signals
+        create_pending_trades(result.accepted, self.ctx.run_date)
+
+        if result.rejected:
+            logger.info(
+                f"Portfolio: {len(result.rejected)} signals rejected — "
+                + " | ".join(f"{r.symbol}:{r.reason}" for r in result.rejected)
+            )
+
+        logger.info(
+            f"Portfolio: {self.ctx.signals_generated} BUY signals accepted | "
+            f"total_risk={result.total_risk_pct:.1%} | "
+            f"slots_used={result.active_positions + self.ctx.signals_generated}"
+        )
 
     # ── Stage 10: Notifications ───────────────────────────────
 

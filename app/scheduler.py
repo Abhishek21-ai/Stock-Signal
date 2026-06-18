@@ -35,7 +35,10 @@ async def run_daily_pipeline() -> None:
 async def run_gap_check() -> None:
     """Pre-market open: check overnight gaps on active trades (Section 19.2)."""
     from app.data.gap_detector import check_overnight_gaps
-    logger.info("🌅 Running overnight gap check")
+    from app.trades.lifecycle import update_trade_states
+    from datetime import date
+    logger.info("🌅 Running overnight gap / pre-market checks")
+    update_trade_states(date.today())
     await check_overnight_gaps()
 
 
