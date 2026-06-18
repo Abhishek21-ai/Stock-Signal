@@ -1,8 +1,12 @@
 """
-DailyPipeline — orchestrates all layers in order.
-Section 4 architecture: Data → Features → Regime → Strategies → Fusion → LLM → Microstructure → Execution Realism → Portfolio → Notifications
+DailyPipeline — full wired implementation.
+Section 4: Data → Features → Regime → Strategies → Fusion → LLM →
+           Microstructure → Execution Realism → Portfolio → Notifications
 
-Each stage is timed and recorded in pipeline_runs table (Section 24).
+Run manually:
+    python scripts/run_pipeline.py
+
+Or via scheduler at 15:45 IST daily.
 """
 from __future__ import annotations
 
@@ -13,7 +17,6 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Dict, List, Optional
 
-from app.db import get_async_db
 from app.logger import get_logger
 from config.settings import settings
 
@@ -22,69 +25,60 @@ logger = get_logger("pipeline")
 
 @dataclass
 class PipelineContext:
-    """Shared state passed through all pipeline stages."""
-    run_date: date = field(default_factory=date.today)
-    run_uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
-    stocks: List[str] = field(default_factory=list)
-    skipped_stocks: List[str] = field(default_factory=list)
+    run_date:          date  = field(default_factory=date.today)
+    run_uuid:          str   = field(default_factory=lambda: str(uuid.uuid4()))
+    stocks:            List[str] = field(default_factory=list)
+    skipped_stocks:    List[str] = field(default_factory=list)
     data_sla_breaches: List[str] = field(default_factory=list)
-    stage_timings: Dict[str, int] = field(default_factory=dict)   # ms per stage
+    stage_timings:     Dict[str, int] = field(default_factory=dict)
     signals_generated: int = 0
-    llm_overrides: int = 0
-    llm_timeouts: int = 0
-    errors: List[str] = field(default_factory=list)
+    llm_overrides:     int = 0
+    llm_timeouts:      int = 0
+    errors:            List[str] = field(default_factory=list)
+
+    # Inter-stage data (passed between stages via context)
+    raw_data:          Dict = field(default_factory=dict)   # {symbol: DataFrame}
+    features:          Dict = field(default_factory=dict)   # {symbol: feature_dict}
+    regime:            Optional[object] = None              # RegimeResult
+    strategy_results:  Dict = field(default_factory=dict)   # {symbol: [StrategyResult]}
+    fused_signals:     List = field(default_factory=list)   # [FusedSignal]
+    final_signals:     List = field(default_factory=list)   # after LLM + microstructure
 
 
 class DailyPipeline:
-    """
-    Runs the full daily signal generation pipeline.
-    Stages map 1:1 to the architecture layers in Section 4.
-    """
 
-    def __init__(self):
-        self.ctx = PipelineContext(stocks=list(settings.watchlist))
+    def __init__(self, stocks: Optional[List[str]] = None, run_date: Optional[date] = None):
+        self.ctx = PipelineContext(
+            stocks=stocks or list(settings.watchlist),
+            run_date=run_date or date.today(),
+        )
 
-    async def run(self) -> None:
+    async def run(self) -> PipelineContext:
         started_at = datetime.utcnow()
         status = "SUCCESS"
 
         try:
-            # ── Gate: NSE holiday check (Section 19.3) ────────────
+            # ── Gate: NSE holiday check ───────────────────────────
             if await self._is_market_closed():
-                logger.info(f"Market closed on {self.ctx.run_date} — skipping pipeline")
+                logger.info(f"NSE holiday on {self.ctx.run_date} — pipeline skipped")
                 await self._record_run(started_at, "MARKET_CLOSED")
-                return
+                return self.ctx
 
-            # ── Stage 1: Data Ingestion ───────────────────────────
-            await self._timed_stage("ingestion", self._run_ingestion)
+            logger.info(
+                f"Pipeline start | date={self.ctx.run_date} | "
+                f"stocks={len(self.ctx.stocks)} | uuid={self.ctx.run_uuid}"
+            )
 
-            # ── Stage 2: Feature Engineering ─────────────────────
-            await self._timed_stage("features", self._run_features)
-
-            # ── Stage 3: Regime Detection ────────────────────────
-            await self._timed_stage("regime", self._run_regime)
-
-            # ── Stage 4: Strategy Engines ────────────────────────
-            await self._timed_stage("strategies", self._run_strategies)
-
-            # ── Stage 5: Signal Fusion ───────────────────────────
-            await self._timed_stage("fusion", self._run_fusion)
-
-            # ── Stage 6: LLM Override Layer ──────────────────────
-            await self._timed_stage("llm", self._run_llm)
-
-            # ── Stage 7: Microstructure Filters ─────────────────
-            # (circuit breakers, gaps, macro window, pledge checks)
-            await self._timed_stage("microstructure", self._run_microstructure)
-
-            # ── Stage 8: Execution Realism ───────────────────────
+            await self._timed_stage("ingestion",         self._run_ingestion)
+            await self._timed_stage("features",          self._run_features)
+            await self._timed_stage("regime",            self._run_regime)
+            await self._timed_stage("strategies",        self._run_strategies)
+            await self._timed_stage("fusion",            self._run_fusion)
+            await self._timed_stage("llm",               self._run_llm)
+            await self._timed_stage("microstructure",    self._run_microstructure)
             await self._timed_stage("execution_realism", self._run_execution_realism)
-
-            # ── Stage 9: Portfolio Constraints ───────────────────
-            await self._timed_stage("portfolio", self._run_portfolio)
-
-            # ── Stage 10: Notifications ──────────────────────────
-            await self._timed_stage("notifications", self._run_notifications)
+            await self._timed_stage("portfolio",         self._run_portfolio)
+            await self._timed_stage("notifications",     self._run_notifications)
 
         except Exception as e:
             status = "FAILED"
@@ -94,109 +88,319 @@ class DailyPipeline:
         finally:
             total_ms = sum(self.ctx.stage_timings.values())
             logger.info(
-                f"Pipeline complete | date={self.ctx.run_date} | "
-                f"status={status} | signals={self.ctx.signals_generated} | "
-                f"total={total_ms}ms"
+                f"Pipeline complete | status={status} | "
+                f"signals={self.ctx.signals_generated} | total={total_ms}ms"
             )
             await self._record_run(started_at, status)
 
-    async def _timed_stage(self, name: str, coro) -> None:
-        t0 = time.monotonic()
-        await coro()
-        elapsed_ms = int((time.monotonic() - t0) * 1000)
-        self.ctx.stage_timings[name] = elapsed_ms
-        logger.info(f"Stage [{name}] completed in {elapsed_ms}ms")
+        return self.ctx
 
-    # ── Stage implementations (stubs — filled in next layers) ──
+    # ── Stage 1: Data Ingestion ───────────────────────────────
+
+    async def _run_ingestion(self) -> None:
+        from app.data.ingestor import DataIngestor
+        ingestor = DataIngestor(
+            stocks=self.ctx.stocks,
+            run_date=self.ctx.run_date,
+        )
+        # Run sync ingestor in thread pool (yfinance is blocking)
+        loop = asyncio.get_event_loop()
+        self.ctx.raw_data = await loop.run_in_executor(None, ingestor.run)
+
+        self.ctx.data_sla_breaches = ingestor.sla_breaches
+        self.ctx.skipped_stocks    = ingestor.skipped
+
+        # Remove stocks with no data from pipeline
+        active = list(self.ctx.raw_data.keys())
+        logger.info(
+            f"Ingestion: {len(active)} stocks OK | "
+            f"skipped={len(self.ctx.skipped_stocks)} | "
+            f"sla_breaches={len(self.ctx.data_sla_breaches)}"
+        )
+
+    # ── Stage 2: Feature Engineering ─────────────────────────
+
+    async def _run_features(self) -> None:
+        from app.features.engineer import FeatureEngineer
+        engineer = FeatureEngineer()
+        loop = asyncio.get_event_loop()
+        self.ctx.features = await loop.run_in_executor(
+            None,
+            engineer.run,
+            list(self.ctx.raw_data.keys()),
+            self.ctx.run_date,
+        )
+        logger.info(f"Features: computed for {len(self.ctx.features)} stocks")
+
+    # ── Stage 3: Regime Detection ─────────────────────────────
+
+    async def _run_regime(self) -> None:
+        from app.regime.detector import RegimeDetector
+        detector = RegimeDetector(run_date=self.ctx.run_date)
+        loop = asyncio.get_event_loop()
+        self.ctx.regime = await loop.run_in_executor(None, detector.run)
+        logger.info(
+            f"Regime: {self.ctx.regime.regime} ({self.ctx.regime.regime_confidence}) | "
+            f"Nifty={self.ctx.regime.nifty_close:.0f} ADX={self.ctx.regime.nifty_adx:.1f}"
+        )
+
+    # ── Stage 4: Strategy Engines ────────────────────────────
+
+    async def _run_strategies(self) -> None:
+        from app.strategies.runner import StrategyRunner
+        runner  = StrategyRunner()
+        regime  = self.ctx.regime.regime if self.ctx.regime else "UNCERTAIN"
+
+        loop    = asyncio.get_event_loop()
+
+        def _run_all():
+            results = {}
+            for symbol, features in self.ctx.features.items():
+                results[symbol] = runner.run(features, regime=regime)
+            return results
+
+        self.ctx.strategy_results = await loop.run_in_executor(None, _run_all)
+        logger.info(f"Strategies: ran for {len(self.ctx.strategy_results)} stocks")
+
+    # ── Stage 5: Signal Fusion ────────────────────────────────
+
+    async def _run_fusion(self) -> None:
+        from app.fusion.engine import FusionEngine
+        if not self.ctx.regime:
+            from app.regime.detector import RegimeResult, REGIME_WEIGHTS
+            self.ctx.regime = RegimeResult(
+                regime="UNCERTAIN", regime_confidence="NORMAL",
+                fusion_weights=dict(REGIME_WEIGHTS["UNCERTAIN"]),
+            )
+
+        engine = FusionEngine(
+            regime_result=self.ctx.regime,
+            run_date=self.ctx.run_date,
+        )
+        loop = asyncio.get_event_loop()
+        self.ctx.fused_signals = await loop.run_in_executor(
+            None,
+            lambda: engine.run(
+                self.ctx.strategy_results,
+                all_features=self.ctx.features,
+                save_to_db=True,
+            ),
+        )
+        self.ctx.signals_generated = len(self.ctx.fused_signals)
+        logger.info(
+            f"Fusion: {self.ctx.signals_generated} signals | "
+            f"BUY={sum(1 for s in self.ctx.fused_signals if 'BUY' in s.signal)} | "
+            f"SELL={sum(1 for s in self.ctx.fused_signals if 'SELL' in s.signal)} | "
+            f"HOLD={sum(1 for s in self.ctx.fused_signals if s.signal == 'HOLD')}"
+        )
+
+    # ── Stage 6: LLM Override ────────────────────────────────
+
+    async def _run_llm(self) -> None:
+        from app.llm.override import LLMOverrideEngine
+        engine = LLMOverrideEngine(
+            regime=self.ctx.regime,
+            features_map=self.ctx.features,
+            run_date=self.ctx.run_date,
+        )
+        self.ctx.fused_signals = await engine.run(self.ctx.fused_signals)
+
+        self.ctx.llm_overrides = sum(
+            1 for s in self.ctx.fused_signals
+            if any("VETO" in r or "reduced confidence" in r for r in s.reasons)
+        )
+        logger.info(f"LLM: {self.ctx.llm_overrides} overrides")
+
+    # ── Stage 7: Microstructure Filters ──────────────────────
+
+    async def _run_microstructure(self) -> None:
+        from app.data.microstructure import apply_microstructure_filters
+
+        loop = asyncio.get_event_loop()
+
+        def _apply_all():
+            for signal in self.ctx.fused_signals:
+                features = self.ctx.features.get(signal.symbol, {})
+                confidence = signal.confidence
+                result = apply_microstructure_filters(
+                    signal.symbol, self.ctx.run_date, confidence
+                )
+                if result["suppress_signal"]:
+                    signal.signal    = "HOLD"
+                    signal.fused_score = 0.0
+                    signal.reasons.append(
+                        f"Microstructure suppressed: circuit={result['circuit_hit']} "
+                        f"gap={result['gap_open_type']} pledge={result['pledge_risk_flag']}"
+                    )
+                elif result["adjusted_confidence"] != confidence:
+                    signal.confidence = result["adjusted_confidence"]
+                    signal.reasons.append(
+                        f"Confidence adjusted by microstructure filters "
+                        f"({confidence:.0f}% → {signal.confidence:.0f}%)"
+                    )
+
+        await loop.run_in_executor(None, _apply_all)
+        suppressed = sum(1 for s in self.ctx.fused_signals if s.signal == "HOLD" and s.fused_score == 0)
+        logger.info(f"Microstructure: {suppressed} signals suppressed")
+
+    # ── Stage 8: Execution Realism ────────────────────────────
+
+    async def _run_execution_realism(self) -> None:
+        from app.data.execution_realism import apply_execution_realism
+
+        loop = asyncio.get_event_loop()
+
+        def _apply_all():
+            for signal in self.ctx.fused_signals:
+                if signal.signal == "HOLD" or not signal.entry_price:
+                    continue
+                features  = self.ctx.features.get(signal.symbol, {})
+                close     = features.get("close", signal.entry_price)
+                avg_vol   = features.get("volume_sma_20", 1_000_000)
+                pos_value = (features.get("close", 100) *
+                             _position_shares(signal, features))
+                result = apply_execution_realism(
+                    symbol=signal.symbol,
+                    theoretical_entry=signal.entry_price,
+                    theoretical_target=signal.target_price or signal.entry_price * 1.06,
+                    theoretical_stop=signal.stop_loss or signal.entry_price * 0.97,
+                    position_value_inr=pos_value,
+                    avg_daily_volume=avg_vol,
+                    close_price=close,
+                )
+                # Attach realistic prices to signal reasons for transparency
+                signal.reasons.append(
+                    f"Realistic entry ₹{result['entry_price_realistic']} | "
+                    f"slip={result['slippage_factor_pct']:.3%} | "
+                    f"R:R realistic={result['rr_ratio_realistic']}"
+                )
+
+        await loop.run_in_executor(None, _apply_all)
+        logger.info("Execution realism: applied to all BUY/SELL signals")
+
+    # ── Stage 9: Portfolio Constraints ───────────────────────
+
+    async def _run_portfolio(self) -> None:
+        """
+        Applies position sizing and portfolio-level caps.
+        Section 21: max 8 open positions, 30% sector cap, 15% single stock cap.
+        Full portfolio manager: app/portfolio/manager.py (next build layer).
+        For now: enforce max open positions by score rank.
+        """
+        buy_signals = [s for s in self.ctx.fused_signals if "BUY" in s.signal]
+        buy_signals.sort(key=lambda s: s.fused_score, reverse=True)
+
+        # Cap at max_open_positions
+        allowed = settings.max_open_positions
+        for i, signal in enumerate(buy_signals):
+            if i >= allowed:
+                signal.signal    = "HOLD"
+                signal.fused_score = 0.0
+                signal.reasons.append(
+                    f"Portfolio cap: max {allowed} positions reached — signal deferred"
+                )
+
+        active_buys = sum(1 for s in self.ctx.fused_signals if "BUY" in s.signal)
+        logger.info(f"Portfolio: {active_buys} BUY signals within position cap={allowed}")
+
+    # ── Stage 10: Notifications ───────────────────────────────
+
+    async def _run_notifications(self) -> None:
+        """
+        Dispatch signals via Telegram.
+        Full dispatcher: app/notifications/dispatcher.py (next build layer).
+        """
+        actionable = [s for s in self.ctx.fused_signals if s.signal != "HOLD"]
+        if not actionable:
+            logger.info("Notifications: no actionable signals to send")
+            return
+
+        if settings.telegram_enabled:
+            try:
+                from app.notifications.telegram import send_signal_digest
+                await send_signal_digest(actionable, self.ctx.regime, self.ctx.run_date)
+            except Exception as e:
+                logger.warning(f"Telegram notification failed: {e}")
+        else:
+            logger.info(
+                f"Notifications: Telegram not configured | "
+                f"{len(actionable)} actionable signals ready"
+            )
+
+    # ── Helpers ───────────────────────────────────────────────
 
     async def _is_market_closed(self) -> bool:
         from app.data.market_calendar import is_nse_holiday
         return await is_nse_holiday(self.ctx.run_date)
 
-    async def _run_ingestion(self) -> None:
-        # Implemented in: app/data/ingestor.py
-        logger.info(f"Ingesting data for {len(self.ctx.stocks)} stocks")
-
-    async def _run_features(self) -> None:
-        # Implemented in: app/features/engineer.py
-        logger.info("Engineering features")
-
-    async def _run_regime(self) -> None:
-        # Implemented in: app/regime/detector.py
-        logger.info("Detecting market regime")
-
-    async def _run_strategies(self) -> None:
-        # Implemented in: app/strategies/
-        logger.info("Running strategy engines")
-
-    async def _run_fusion(self) -> None:
-        # Implemented in: app/fusion/engine.py
-        logger.info("Running signal fusion")
-
-    async def _run_llm(self) -> None:
-        # Implemented in: app/llm/override.py
-        logger.info("Running LLM override layer")
-
-    async def _run_microstructure(self) -> None:
-        # Implemented in: app/data/microstructure.py
-        logger.info("Applying microstructure filters")
-
-    async def _run_execution_realism(self) -> None:
-        # Implemented in: app/data/execution_realism.py
-        logger.info("Applying execution realism")
-
-    async def _run_portfolio(self) -> None:
-        # Implemented in: app/portfolio/manager.py
-        logger.info("Applying portfolio constraints")
-
-    async def _run_notifications(self) -> None:
-        # Implemented in: app/notifications/dispatcher.py
-        logger.info("Sending notifications")
+    async def _timed_stage(self, name: str, coro) -> None:
+        t0 = time.monotonic()
+        try:
+            await coro()
+        except Exception as e:
+            logger.error(f"Stage [{name}] failed: {e}")
+            self.ctx.errors.append(f"{name}: {e}")
+            raise
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        self.ctx.stage_timings[name] = elapsed_ms
+        logger.info(f"Stage [{name}] ✓ {elapsed_ms}ms")
 
     async def _record_run(self, started_at: datetime, status: str) -> None:
-        """Write pipeline run record to pipeline_runs table (Section 24)."""
         try:
-            async with get_async_db() as db:
-                await db.execute(
+            from app.db import get_sync_db
+            with get_sync_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
                     """
                     INSERT INTO pipeline_runs (
                         run_uuid, run_date, started_at, completed_at,
                         ingestion_ms, features_ms, regime_ms, strategies_ms,
                         fusion_ms, llm_ms, notifications_ms, total_ms,
                         stocks_processed, stocks_skipped, signals_generated,
-                        llm_overrides, llm_timeouts, data_sla_breaches, status, error_message
+                        llm_overrides, llm_timeouts, data_sla_breaches,
+                        status, error_message
                     ) VALUES (
-                        :run_uuid, :run_date, :started_at, NOW(),
-                        :ingestion_ms, :features_ms, :regime_ms, :strategies_ms,
-                        :fusion_ms, :llm_ms, :notifications_ms, :total_ms,
-                        :stocks_processed, :stocks_skipped, :signals_generated,
-                        :llm_overrides, :llm_timeouts, :sla_breaches, :status, :error
+                        %s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,%s,%s,%s,%s
                     )
                     ON CONFLICT (run_date) DO UPDATE SET
-                        completed_at = NOW(), status = EXCLUDED.status,
-                        error_message = EXCLUDED.error_message
+                        completed_at=NOW(), status=EXCLUDED.status,
+                        signals_generated=EXCLUDED.signals_generated,
+                        llm_overrides=EXCLUDED.llm_overrides,
+                        total_ms=EXCLUDED.total_ms,
+                        error_message=EXCLUDED.error_message
                     """,
-                    {
-                        "run_uuid": self.ctx.run_uuid,
-                        "run_date": self.ctx.run_date,
-                        "started_at": started_at,
-                        "ingestion_ms": self.ctx.stage_timings.get("ingestion"),
-                        "features_ms": self.ctx.stage_timings.get("features"),
-                        "regime_ms": self.ctx.stage_timings.get("regime"),
-                        "strategies_ms": self.ctx.stage_timings.get("strategies"),
-                        "fusion_ms": self.ctx.stage_timings.get("fusion"),
-                        "llm_ms": self.ctx.stage_timings.get("llm"),
-                        "notifications_ms": self.ctx.stage_timings.get("notifications"),
-                        "total_ms": sum(self.ctx.stage_timings.values()),
-                        "stocks_processed": len(self.ctx.stocks) - len(self.ctx.skipped_stocks),
-                        "stocks_skipped": len(self.ctx.skipped_stocks),
-                        "signals_generated": self.ctx.signals_generated,
-                        "llm_overrides": self.ctx.llm_overrides,
-                        "llm_timeouts": self.ctx.llm_timeouts,
-                        "sla_breaches": self.ctx.data_sla_breaches,
-                        "status": status,
-                        "error": "; ".join(self.ctx.errors) if self.ctx.errors else None,
-                    },
+                    (
+                        self.ctx.run_uuid, self.ctx.run_date, started_at,
+                        self.ctx.stage_timings.get("ingestion"),
+                        self.ctx.stage_timings.get("features"),
+                        self.ctx.stage_timings.get("regime"),
+                        self.ctx.stage_timings.get("strategies"),
+                        self.ctx.stage_timings.get("fusion"),
+                        self.ctx.stage_timings.get("llm"),
+                        self.ctx.stage_timings.get("notifications"),
+                        sum(self.ctx.stage_timings.values()),
+                        len(self.ctx.stocks) - len(self.ctx.skipped_stocks),
+                        len(self.ctx.skipped_stocks),
+                        self.ctx.signals_generated,
+                        self.ctx.llm_overrides,
+                        self.ctx.llm_timeouts,
+                        self.ctx.data_sla_breaches,
+                        status,
+                        "; ".join(self.ctx.errors) if self.ctx.errors else None,
+                    ),
                 )
         except Exception as e:
             logger.error(f"Failed to record pipeline run: {e}")
+
+
+def _position_shares(signal, features: dict) -> int:
+    """Rough position size for execution realism calc."""
+    close = features.get("close", 100)
+    risk_inr = settings.portfolio_value_inr * settings.risk_per_trade_pct
+    atr = features.get("atr_14", close * 0.02)
+    if atr <= 0 or close <= 0:
+        return 0
+    shares = int(risk_inr / (1.5 * atr))
+    max_shares = int(settings.portfolio_value_inr * settings.max_single_stock_pct / close)
+    return min(shares, max_shares)

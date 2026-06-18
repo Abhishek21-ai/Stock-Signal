@@ -35,6 +35,8 @@ class StrategyRunner:
                 result = strategy.run(features, regime=regime)
                 results.append(result)
             except Exception as e:
-                logger.error(f"Strategy {strategy.strategy_id} failed for "
-                             f"{features.get('symbol','?')}: {e}")
+                logger.error(
+                    f"Strategy {strategy.strategy_id} failed for "
+                    f"{features.get('symbol', '?')}: {e}"
+                )
         return results
