@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     groq_model: str = "llama-3.3-70b-versatile"
     groq_timeout_seconds: int = 10
     openai_api_key: str = ""
+    google_api_key: str = ""
 
     # ── Notifications ────────────────────────────────────────
     telegram_bot_token: str = ""
