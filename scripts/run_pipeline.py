@@ -7,11 +7,12 @@ Usage:
     python scripts/run_pipeline.py --date 2026-06-17
 """
 import sys, os, asyncio, argparse
+
+# sys.path must be set up BEFORE any `app.*` imports below
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from datetime import date
 from app.cache import get_redis
-import asyncio
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def parse_args():
@@ -67,6 +68,7 @@ async def main():
 
     print(f"\n{'='*65}\n")
 
+
 async def run():
     try:
         await main()
@@ -75,6 +77,7 @@ async def run():
             await get_redis().aclose()
         except Exception:
             pass
+
 
 if __name__ == "__main__":
     asyncio.run(run())

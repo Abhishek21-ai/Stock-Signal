@@ -453,10 +453,12 @@ class LLMOverrideEngine:
         features_map: Dict[str, Dict],
         run_date: Optional[date] = None,
     ):
-        self.regime       = regime
-        self.features_map = features_map
-        self.run_date     = run_date or date.today()
-        self.session_stats = LLMSessionStats()
+        self.regime        = regime
+        self.features_map  = features_map
+        self.run_date       = run_date or date.today()
+        self.session_stats  = LLMSessionStats()
+        self.override_count = 0     # set after run() — exact VETO+REDUCE_CONFIDENCE count
+        self.total_reviewed = 0     # set after run() — total BUY signals sent to LLM
 
     async def run(self, signals: List[FusedSignal]) -> List[FusedSignal]:
         """
@@ -471,6 +473,7 @@ class LLMOverrideEngine:
 
         buy_signals  = [s for s in signals if "BUY" in s.signal]
         pass_signals = [s for s in signals if "BUY" not in s.signal]
+        self.total_reviewed = len(buy_signals)
 
         logger.info(
             f"LLM override: {len(buy_signals)} BUY signals to review | "
@@ -497,6 +500,8 @@ class LLMOverrideEngine:
                     f"— remaining signals passed through"
                 )
                 break
+
+        self.override_count = override_count   # ← exposed for pipeline.py to read directly
 
         all_signals = buy_signals + pass_signals
         priority = {"STRONG_BUY": 0, "BUY": 1, "HOLD": 2, "SELL": 3, "STRONG_SELL": 4}

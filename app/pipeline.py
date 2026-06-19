@@ -79,6 +79,7 @@ class DailyPipeline:
             await self._timed_stage("execution_realism", self._run_execution_realism)
             await self._timed_stage("portfolio",         self._run_portfolio)
             await self._timed_stage("notifications",     self._run_notifications)
+            await self._timed_stage("monitoring",        self._run_monitoring)
 
         except Exception as e:
             status = "FAILED"
@@ -205,10 +206,9 @@ class DailyPipeline:
         )
         self.ctx.fused_signals = await engine.run(self.ctx.fused_signals)
 
-        self.ctx.llm_overrides = sum(
-            1 for s in self.ctx.fused_signals
-            if any("VETO" in r or "reduced confidence" in r for r in s.reasons)
-        )
+        # Read exact count from engine instead of string-matching `reasons`,
+        # which is fragile (other stages can coincidentally contain similar text).
+        self.ctx.llm_overrides = engine.override_count
         logger.info(f"LLM: {self.ctx.llm_overrides} overrides")
 
     # ── Stage 7: Microstructure Filters ──────────────────────
@@ -341,17 +341,25 @@ class DailyPipeline:
                 f"{len(actionable)} actionable signals ready"
             )
 
-    # ── Stage 11: monitoring ───────────────────────────────
+    # ── Stage 11: Monitoring ───────────────────────────────
 
     async def _run_monitoring(self) -> None:
-        from app.monitoring.health import HealthMonitor
-        monitor = HealthMonitor(run_date=self.ctx.run_date)
-        await monitor.run_and_alert(
-            sla_breaches=self.ctx.data_sla_breaches,
-            llm_timeouts=self.ctx.llm_timeouts,
-            llm_total_calls=self.ctx.llm_overrides + self.ctx.llm_timeouts,  # approx
-            stage_timings=self.ctx.stage_timings,
-        )
+        """
+        Section 24: post-run health check.
+        Failures here are logged but never fail the overall pipeline —
+        observability should never be a single point of failure.
+        """
+        try:
+            from app.monitoring.health import HealthMonitor
+            monitor = HealthMonitor(run_date=self.ctx.run_date)
+            await monitor.run_and_alert(
+                sla_breaches=self.ctx.data_sla_breaches,
+                llm_timeouts=self.ctx.llm_timeouts,
+                llm_total_calls=self.ctx.llm_overrides + self.ctx.llm_timeouts,
+                stage_timings=self.ctx.stage_timings,
+            )
+        except Exception as e:
+            logger.warning(f"Monitoring stage failed (non-fatal): {e}")
 
 
     # ── Helpers ───────────────────────────────────────────────
