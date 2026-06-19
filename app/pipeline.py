@@ -341,6 +341,19 @@ class DailyPipeline:
                 f"{len(actionable)} actionable signals ready"
             )
 
+    # ── Stage 11: monitoring ───────────────────────────────
+
+    async def _run_monitoring(self) -> None:
+        from app.monitoring.health import HealthMonitor
+        monitor = HealthMonitor(run_date=self.ctx.run_date)
+        await monitor.run_and_alert(
+            sla_breaches=self.ctx.data_sla_breaches,
+            llm_timeouts=self.ctx.llm_timeouts,
+            llm_total_calls=self.ctx.llm_overrides + self.ctx.llm_timeouts,  # approx
+            stage_timings=self.ctx.stage_timings,
+        )
+
+
     # ── Helpers ───────────────────────────────────────────────
 
     async def _is_market_closed(self) -> bool:

@@ -175,7 +175,7 @@ def test_active_stop_hit():
         row = cur.fetchone()
         assert row["exit_reason"] == "STOP"
         assert float(row["pnl_pct"]) < 0   # should be a loss
-        print(f"  ✅ Stop hit: pnl={float(row['pnl_pct']):.2%} | exit={row['exit_reason']}")
+        print(f"  ✅ Stop hit: pnl={float(row['pnl_pct']):.2f}% | exit={row['exit_reason']}")
     cleanup_test_trades()
 
 
@@ -217,7 +217,7 @@ def test_active_target_hit():
         row = cur.fetchone()
         assert row["exit_reason"] == "TARGET"
         assert float(row["pnl_pct"]) > 0   # should be a profit
-        print(f"  ✅ Target hit: pnl={float(row['pnl_pct']):.2%} | exit={row['exit_reason']}")
+        print(f"  ✅ Target hit: pnl={float(row['pnl_pct']):.2f}% | exit={row['exit_reason']}")
     cleanup_test_trades()
 
 
