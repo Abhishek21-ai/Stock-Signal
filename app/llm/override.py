@@ -4,21 +4,25 @@ LLM Override Layer — Section 10 & 27
 Flow per stock:
   1. Check Redis cache (key: llm_override:{symbol}:{date}, TTL 24h) — skip API if hit
   2. Build structured prompt from FusedSignal + RegimeResult + features
-  3. Call Groq (llama-3.3-70b-versatile) with 10s timeout
-  4. Fallback to OpenAI gpt-4o-mini if Groq fails/times out
-  5. Parse LLM response → LLMVerdict (CONFIRM | VETO | REDUCE_CONFIDENCE)
-  6. Apply verdict to FusedSignal score/confidence
-  7. Cache result in Redis (24h TTL)
-  8. Update daily_signals row in DB (llm_override, llm_status, llm_explanation)
+  3. Call Groq (llama-3.3-70b-versatile) with 10s timeout       [primary]
+  4. Fallback to Gemini (gemini-1.5-flash) if Groq fails         [secondary, free tier]
+  5. Fallback to OpenAI gpt-4o-mini if Gemini also fails         [tertiary]
+  6. If ALL three fail → rule-based fallback (Section 27.1)      [deterministic, no API]
+  7. Apply verdict to FusedSignal score/confidence
+  8. Cache result in Redis (24h TTL)
+  9. Update daily_signals row in DB (llm_override, llm_status, llm_explanation)
 
 Override rate cap (Section 10.3):
   Max 30% of signals may be overridden per run (settings.max_llm_override_rate).
-  If cap is hit, remaining signals get llm_override=NONE with status=FALLBACK.
 
 Verdict effects:
   CONFIRM          → no score change, llm_override=NONE
   VETO             → score set to 0, signal → HOLD, confidence halved
   REDUCE_CONFIDENCE→ confidence reduced by 25%
+
+Session-level failure tracking (Section 24.1):
+  If >20% of LLM calls in a session time out, all subsequent calls in that
+  session skip straight to rule-based fallback (no more API attempts wasted).
 """
 from __future__ import annotations
 
@@ -30,25 +34,31 @@ from datetime import date
 from typing import Dict, List, Optional
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 
 from app.cache import llm_cache
 from app.db import get_sync_db
 from app.fusion.engine import FusedSignal
+from app.llm.rule_fallback import apply_rule_based_fallback
 from app.logger import get_logger
 from app.regime.detector import RegimeResult
-from app.strategies.base import score_to_signal
 from config.settings import settings
 
 logger = get_logger("llm")
 
 # ── Constants ─────────────────────────────────────────────────
-GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
+OPENAI_URL  = "https://api.openai.com/v1/chat/completions"
+GEMINI_URL  = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.5-flash-lite:generateContent"
+)
 LLM_CACHE_TTL = 86_400          # 24 hours
 CONFIDENCE_REDUCTION = 25.0     # pct points removed on REDUCE_CONFIDENCE
 
 VALID_VERDICTS = {"CONFIRM", "VETO", "REDUCE_CONFIDENCE"}
+
+# Session-level failure tracking (Section 24.1: >20% triggers fallback mode)
+SESSION_FAILURE_THRESHOLD = 0.20
 
 
 # ── Data classes ──────────────────────────────────────────────
@@ -57,8 +67,8 @@ VALID_VERDICTS = {"CONFIRM", "VETO", "REDUCE_CONFIDENCE"}
 class LLMVerdict:
     verdict: str                 # CONFIRM | VETO | REDUCE_CONFIDENCE
     explanation: str
-    llm_status: str              # OK | TIMEOUT | FALLBACK | ERROR | CACHED
-    provider: str                # groq | openai | cache | none
+    llm_status: str              # OK | TIMEOUT | FALLBACK | ERROR | CACHED | RULE_BASED
+    provider: str                # groq | gemini | openai | cache | rule_based | none
     latency_ms: int = 0
 
     def to_dict(self) -> Dict:
@@ -154,6 +164,28 @@ async def _call_groq(prompt: str, timeout: int) -> str:
         return resp.json()["choices"][0]["message"]["content"].strip()
 
 
+async def _call_gemini(prompt: str, timeout: int = 15) -> str:
+    """
+    Call Google Gemini API (free tier via AI Studio).
+    Returns raw response text.
+    """
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            f"{GEMINI_URL}?key={settings.google_api_key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature":     0.1,
+                    "maxOutputTokens": 120,
+                },
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
 async def _call_openai(prompt: str, timeout: int) -> str:
     """Call OpenAI fallback. Returns raw response text."""
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -174,15 +206,16 @@ async def _call_openai(prompt: str, timeout: int) -> str:
         return resp.json()["choices"][0]["message"]["content"].strip()
 
 
-def _parse_verdict(raw: str) -> LLMVerdict | None:
+def _parse_verdict(raw: str) -> Optional[LLMVerdict]:
     """
     Parse LLM JSON response into LLMVerdict.
     Returns None if parsing fails.
     """
     try:
-        # Strip markdown fences if present
-        clean = raw.strip().strip("```json").strip("```").strip()
-        data  = json.loads(clean)
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = clean.strip("`").lstrip("json").strip()
+        data    = json.loads(clean)
         verdict = data.get("verdict", "").strip().upper()
         if verdict not in VALID_VERDICTS:
             logger.warning(f"Unexpected verdict: {verdict!r} — defaulting to CONFIRM")
@@ -198,16 +231,46 @@ def _parse_verdict(raw: str) -> LLMVerdict | None:
         return None
 
 
+# ── Session-level failure tracking (Section 24.1) ──────────────
+
+class LLMSessionStats:
+    """
+    Tracks success/failure across a single pipeline run.
+    If failure rate exceeds 20%, subsequent calls skip API attempts
+    and go straight to rule-based fallback to save time.
+    """
+    def __init__(self):
+        self.total_calls   = 0
+        self.failed_calls  = 0   # all providers failed (not counting cache hits)
+
+    def record(self, all_providers_failed: bool) -> None:
+        self.total_calls += 1
+        if all_providers_failed:
+            self.failed_calls += 1
+
+    @property
+    def failure_rate(self) -> float:
+        if self.total_calls == 0:
+            return 0.0
+        return self.failed_calls / self.total_calls
+
+    @property
+    def should_skip_api(self) -> bool:
+        """After at least 5 calls, if failure rate exceeds threshold, skip API."""
+        return self.total_calls >= 5 and self.failure_rate > SESSION_FAILURE_THRESHOLD
+
+
 # ── Main per-symbol override ──────────────────────────────────
 
 async def get_llm_verdict(
     signal: FusedSignal,
     regime: RegimeResult,
     features: Dict,
+    session_stats: Optional[LLMSessionStats] = None,
 ) -> LLMVerdict:
     """
     Get LLM verdict for a single signal.
-    Checks cache first, then Groq, then OpenAI fallback.
+    Chain: cache -> Groq -> Gemini -> OpenAI -> rule-based fallback.
     """
     run_date = str(signal.run_date)
 
@@ -222,28 +285,55 @@ async def get_llm_verdict(
             provider="cache",
         )
 
+    # ── Session circuit breaker — skip straight to rule-based ──
+    if session_stats and session_stats.should_skip_api:
+        logger.warning(
+            f"{signal.symbol}: session failure rate "
+            f"{session_stats.failure_rate:.0%} > {SESSION_FAILURE_THRESHOLD:.0%} "
+            f"— skipping API, using rule-based fallback"
+        )
+        verdict = apply_rule_based_fallback(signal, regime, features)
+        if session_stats:
+            session_stats.record(all_providers_failed=False)  # not an API failure
+        return verdict
+
     prompt = build_prompt(signal, regime, features)
     t0     = time.monotonic()
+    verdict = None
 
     # ── 2. Groq (primary) ─────────────────────────────────────
-    verdict = None
-    provider = "groq"
-    try:
-        raw     = await _call_groq(prompt, timeout=settings.groq_timeout_seconds)
-        verdict = _parse_verdict(raw)
-        if verdict:
-            verdict.provider   = "groq"
-            verdict.latency_ms = int((time.monotonic() - t0) * 1000)
-            logger.info(
-                f"{signal.symbol}: Groq verdict={verdict.verdict} "
-                f"({verdict.latency_ms}ms)"
-            )
-    except Exception as e:
-        logger.warning(f"{signal.symbol}: Groq failed ({e}) — trying OpenAI fallback")
+    if settings.groq_api_key:
+        try:
+            raw     = await _call_groq(prompt, timeout=settings.groq_timeout_seconds)
+            verdict = _parse_verdict(raw)
+            if verdict:
+                verdict.provider   = "groq"
+                verdict.latency_ms = int((time.monotonic() - t0) * 1000)
+                logger.info(
+                    f"{signal.symbol}: Groq verdict={verdict.verdict} "
+                    f"({verdict.latency_ms}ms)"
+                )
+        except Exception as e:
+            logger.warning(f"{signal.symbol}: Groq failed ({e}) — trying Gemini")
 
-    # ── 3. OpenAI fallback ────────────────────────────────────
+    # ── 3. Gemini (secondary, free tier) ──────────────────────
+    if verdict is None and settings.google_api_key:
+        try:
+            raw     = await _call_gemini(prompt, timeout=15)
+            verdict = _parse_verdict(raw)
+            if verdict:
+                verdict.provider   = "gemini"
+                verdict.llm_status = "OK"
+                verdict.latency_ms = int((time.monotonic() - t0) * 1000)
+                logger.info(
+                    f"{signal.symbol}: Gemini verdict={verdict.verdict} "
+                    f"({verdict.latency_ms}ms)"
+                )
+        except Exception as e:
+            logger.warning(f"{signal.symbol}: Gemini failed ({e}) — trying OpenAI")
+
+    # ── 4. OpenAI (tertiary) ──────────────────────────────────
     if verdict is None and settings.openai_api_key:
-        provider = "openai"
         try:
             raw     = await _call_openai(prompt, timeout=15)
             verdict = _parse_verdict(raw)
@@ -256,20 +346,22 @@ async def get_llm_verdict(
                     f"({verdict.latency_ms}ms)"
                 )
         except Exception as e:
-            logger.warning(f"{signal.symbol}: OpenAI fallback also failed: {e}")
+            logger.warning(f"{signal.symbol}: OpenAI also failed: {e}")
 
-    # ── 4. Final fallback — CONFIRM with error status ─────────
-    if verdict is None:
-        verdict = LLMVerdict(
-            verdict="CONFIRM",
-            explanation="LLM unavailable — quant signal used as-is",
-            llm_status="ERROR",
-            provider="none",
-            latency_ms=int((time.monotonic() - t0) * 1000),
+    # ── 5. All 3 providers failed → rule-based fallback (§27.1) ─
+    all_failed = verdict is None
+    if all_failed:
+        logger.warning(
+            f"{signal.symbol}: Groq + Gemini + OpenAI all failed — "
+            f"using rule-based fallback (Section 27.1)"
         )
-        logger.warning(f"{signal.symbol}: Both LLM providers failed — defaulting CONFIRM")
+        verdict = apply_rule_based_fallback(signal, regime, features)
+        verdict.latency_ms = int((time.monotonic() - t0) * 1000)
 
-    # ── 5. Cache result ───────────────────────────────────────
+    if session_stats:
+        session_stats.record(all_providers_failed=all_failed)
+
+    # ── 6. Cache result (skip caching rule-based / errors) ─────
     if verdict.llm_status in ("OK", "FALLBACK"):
         await llm_cache.set(
             signal.symbol, run_date, verdict.to_dict(),
@@ -285,19 +377,23 @@ def _apply_verdict(signal: FusedSignal, verdict: LLMVerdict) -> FusedSignal:
     Returns the same signal object for chaining.
     """
     if verdict.verdict == "VETO":
-        logger.info(f"{signal.symbol}: LLM VETO — {verdict.explanation}")
+        logger.info(f"{signal.symbol}: VETO ({verdict.provider}) — {verdict.explanation}")
         signal.fused_score = 0.0
         signal.signal      = "HOLD"
         signal.confidence  = max(0.0, signal.confidence / 2)
-        signal.reasons.append(f"LLM VETO: {verdict.explanation}")
+        signal.reasons.append(f"LLM VETO [{verdict.provider}]: {verdict.explanation}")
 
     elif verdict.verdict == "REDUCE_CONFIDENCE":
-        logger.info(f"{signal.symbol}: LLM REDUCE_CONFIDENCE — {verdict.explanation}")
+        logger.info(
+            f"{signal.symbol}: REDUCE_CONFIDENCE ({verdict.provider}) — {verdict.explanation}"
+        )
         signal.confidence = max(0.0, signal.confidence - CONFIDENCE_REDUCTION)
-        signal.reasons.append(f"LLM reduced confidence: {verdict.explanation}")
+        signal.reasons.append(
+            f"LLM reduced confidence [{verdict.provider}]: {verdict.explanation}"
+        )
 
     else:  # CONFIRM
-        signal.reasons.append(f"LLM confirmed: {verdict.explanation}")
+        signal.reasons.append(f"LLM confirmed [{verdict.provider}]: {verdict.explanation}")
 
     return signal
 
@@ -308,7 +404,6 @@ def _update_db(
     verdict: LLMVerdict,
 ) -> None:
     """Update llm_override fields in daily_signals table."""
-    # Map verdict → DB enum
     override_map = {
         "VETO":              "VETO",
         "REDUCE_CONFIDENCE": "REDUCE_CONFIDENCE",
@@ -316,10 +411,9 @@ def _update_db(
     }
     db_override = override_map.get(verdict.verdict, "NONE")
 
-    # Map status → if timeout/error use TIMEOUT/FALLBACK enums
-    if verdict.llm_status in ("TIMEOUT",):
+    if verdict.llm_status == "TIMEOUT":
         db_override = "TIMEOUT"
-    elif verdict.llm_status in ("ERROR",):
+    elif verdict.llm_status in ("ERROR", "RULE_BASED"):
         db_override = "FALLBACK"
 
     try:
@@ -335,7 +429,7 @@ def _update_db(
                 """,
                 (
                     db_override,
-                    verdict.llm_status,
+                    f"{verdict.llm_status}:{verdict.provider}",
                     verdict.explanation,
                     symbol,
                     run_date,
@@ -362,18 +456,19 @@ class LLMOverrideEngine:
         self.regime       = regime
         self.features_map = features_map
         self.run_date     = run_date or date.today()
+        self.session_stats = LLMSessionStats()
 
     async def run(self, signals: List[FusedSignal]) -> List[FusedSignal]:
         """
-        Process all signals. Only BUY/STRONG_BUY signals go to LLM.
+        Process all signals. Only BUY/STRONG_BUY signals go to LLM review.
         SELL/HOLD signals are passed through unchanged.
         Override rate cap: max 30% of total signals.
         """
         total          = len(signals)
         max_overrides  = int(total * settings.max_llm_override_rate)
         override_count = 0
+        provider_counts: Dict[str, int] = {}
 
-        # Only send BUY-side signals to LLM (cost + latency control)
         buy_signals  = [s for s in signals if "BUY" in s.signal]
         pass_signals = [s for s in signals if "BUY" not in s.signal]
 
@@ -385,15 +480,18 @@ class LLMOverrideEngine:
         for signal in buy_signals:
             features = self.features_map.get(signal.symbol, {})
 
-            verdict = await get_llm_verdict(signal, self.regime, features)
+            verdict = await get_llm_verdict(
+                signal, self.regime, features, session_stats=self.session_stats
+            )
             _apply_verdict(signal, verdict)
             _update_db(signal.symbol, self.run_date, verdict)
+
+            provider_counts[verdict.provider] = provider_counts.get(verdict.provider, 0) + 1
 
             if verdict.verdict in ("VETO", "REDUCE_CONFIDENCE"):
                 override_count += 1
 
-            # Rate cap
-            if override_count >= max_overrides:
+            if override_count >= max_overrides and max_overrides > 0:
                 logger.warning(
                     f"LLM override rate cap hit ({override_count}/{max_overrides}) "
                     f"— remaining signals passed through"
@@ -401,12 +499,13 @@ class LLMOverrideEngine:
                 break
 
         all_signals = buy_signals + pass_signals
-        # Re-sort by score
         priority = {"STRONG_BUY": 0, "BUY": 1, "HOLD": 2, "SELL": 3, "STRONG_SELL": 4}
         all_signals.sort(key=lambda s: (priority.get(s.signal, 5), -s.fused_score))
 
         logger.info(
             f"LLM override complete: {override_count} overrides | "
-            f"BUY={sum(1 for s in all_signals if 'BUY' in s.signal)}"
+            f"BUY={sum(1 for s in all_signals if 'BUY' in s.signal)} | "
+            f"providers={provider_counts} | "
+            f"session_failure_rate={self.session_stats.failure_rate:.0%}"
         )
         return all_signals
