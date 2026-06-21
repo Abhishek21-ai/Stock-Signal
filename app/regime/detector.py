@@ -25,20 +25,20 @@ logger = get_logger("regime_detector")
 
 REGIME_WEIGHTS: Dict[str, Dict[str, float]] = {
     "BULL": {
-        "trend": 0.35, "momentum": 0.25, "reversion": 0.10,
+        "trend": 0.25, "momentum": 0.30, "reversion": 0.15,
         "breakout": 0.20, "volume": 0.10,
     },
     "BEAR": {
-        "trend": 0.30, "momentum": 0.15, "reversion": 0.25,
-        "breakout": 0.10, "volume": 0.20,
+        "trend": 0.0, "momentum": 0.10, "reversion": 0.70,
+        "breakout": 0.0, "volume": 0.20,
     },
     "SIDEWAYS": {
-        "trend": 0.15, "momentum": 0.20, "reversion": 0.35,
-        "breakout": 0.15, "volume": 0.15,
+        "trend": 0.05, "momentum": 0.20, "reversion": 0.60,
+        "breakout": 0.0, "volume": 0.15,
     },
     "UNCERTAIN": {
-        "trend": 0.20, "momentum": 0.20, "reversion": 0.20,
-        "breakout": 0.20, "volume": 0.20,
+        "trend": 0.10, "momentum": 0.20, "reversion": 0.50,
+        "breakout": 0.10, "volume": 0.10,
     },
 }
 
