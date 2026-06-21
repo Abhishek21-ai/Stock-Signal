@@ -27,14 +27,15 @@ from typing import Dict
 from app.strategies.base import BaseStrategy, StrategyResult, score_to_signal
 
 # ── Thresholds ────────────────────────────────────────────────
-MAX_ATR_PCT         = 5.0    # ATR% above this = high volatility penalty
-VETO_ATR_PCT        = 8.0    # ATR% above this = hard veto (too dangerous)
-MAX_DRAWDOWN_PCT    = -20.0  # % from 52w high; below this = falling knife penalty
-VETO_DRAWDOWN_PCT   = -35.0  # below this = hard veto
-MIN_VOLUME_RATIO    = 0.5    # volume/avg_volume below this = illiquid penalty
-VETO_VOLUME_RATIO   = 0.2    # below this = hard veto (can't trade)
-MAX_STOP_PCT        = 7.0    # stop loss > this % below entry = invalid setup
-RR_MIN              = 1.5    # minimum risk/reward ratio required
+# ── Thresholds (Optimized for Drawdown Reduction) ──────────────
+MAX_ATR_PCT         = 3.5    # (Was 5.0) Penalize stocks moving > 3.5% a day
+VETO_ATR_PCT        = 5.5    # (Was 8.0) Hard veto if daily volatility > 5.5%
+MAX_DRAWDOWN_PCT    = -15.0  # (Was -20.0) Don't buy if it's already down 15% from 52w high
+VETO_DRAWDOWN_PCT   = -25.0
+MIN_VOLUME_RATIO    = 0.8    # (Was 0.5) Require at least 80% of avg volume to enter
+VETO_VOLUME_RATIO   = 0.4    # (Was 0.2) Hard veto if volume is completely dead
+RR_MIN              = 1.5    # Keep at 1.5
+MAX_STOP_PCT        = 8.0  # Hard veto if stop loss is > 8% below entry
 
 REGIME_WEIGHTS = {
     "BULL":      0.7,
