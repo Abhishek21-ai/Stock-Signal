@@ -36,10 +36,27 @@ async def run_gap_check() -> None:
     """Pre-market open: check overnight gaps on active trades (Section 19.2)."""
     from app.data.gap_detector import check_overnight_gaps
     from app.trades.lifecycle import update_trade_states
+    from app.notifications.telegram import send_trade_lifecycle_event
     from datetime import date
+
     logger.info("🌅 Running overnight gap / pre-market checks")
-    update_trade_states(date.today())
+    result = update_trade_states(date.today())
     await check_overnight_gaps()
+
+    # Notify on each individual trade state transition — this is the
+    # paper-trading log: every entry, target hit, stop hit, and expiry
+    # shows up in Telegram as it happens, not just in DB rows you'd
+    # otherwise have to query manually.
+    for event in result.get("events", []):
+        try:
+            await send_trade_lifecycle_event(
+                symbol=event["symbol"],
+                event=event["event"],
+                price=event["price"],
+                pnl_pct=event.get("pnl_pct"),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send trade event notification: {e}")
 
 
 async def run_news_ingestion() -> None:

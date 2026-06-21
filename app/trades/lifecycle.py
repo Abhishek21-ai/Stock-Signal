@@ -139,15 +139,31 @@ def create_pending_trades(
 
 # ── Stage 2: Daily state update (pre-market) ─────────────────
 
-def update_trade_states(check_date: date) -> Dict[str, int]:
+def update_trade_states(check_date: date) -> Dict:
     """
     Called daily by scheduler at 08:30 IST.
     Processes yesterday's OHLC against all open trades.
 
-    Returns counts: {activated, expired, stopped, targeted, unchanged}
+    Returns:
+        {
+            "activated": int, "expired": int, "stopped": int,
+            "targeted": int, "unchanged": int,
+            "events": [
+                {"symbol": str, "event": "ENTERED"|"TARGET_HIT"|"STOP_HIT"|"EXPIRED",
+                 "price": float, "pnl_pct": float | None},
+                ...
+            ],
+        }
+
+    The "events" list is additive — existing callers reading counts[...]
+    by key are unaffected. It exists so the async scheduler layer can
+    send individual Telegram notifications per state transition without
+    making this function (deliberately kept synchronous, DB-only) do
+    network I/O itself.
     """
     counts = {"activated": 0, "expired": 0, "stopped": 0,
               "targeted": 0, "unchanged": 0}
+    events: List[Dict] = []
     price_date = check_date - timedelta(days=1)   # yesterday's data
 
     try:
@@ -178,6 +194,10 @@ def update_trade_states(check_date: date) -> Dict[str, int]:
                                  exit_price=entry, exit_reason="EXPIRY",
                                  pnl_pct=0.0, pnl_inr=0.0)
                     counts["expired"] += 1
+                    events.append({
+                        "symbol": stock, "event": "EXPIRED",
+                        "price": entry, "pnl_pct": 0.0,
+                    })
                     logger.info(f"{stock}: PENDING→CLOSED (EXPIRY after {SIGNAL_VALIDITY_DAYS}d)")
                     continue
 
@@ -204,6 +224,10 @@ def update_trade_states(check_date: date) -> Dict[str, int]:
                         (open_price, price_date, trade["id"]),
                     )
                     counts["activated"] += 1
+                    events.append({
+                        "symbol": stock, "event": "ENTERED",
+                        "price": open_price, "pnl_pct": None,
+                    })
                     logger.info(
                         f"{stock}: PENDING→ACTIVE | "
                         f"entry=₹{open_price:.2f} (gap={gap_pct:.3%})"
@@ -275,10 +299,22 @@ def update_trade_states(check_date: date) -> Dict[str, int]:
 
                     if exit_reason == "STOP":
                         counts["stopped"] += 1
+                        events.append({
+                            "symbol": stock, "event": "STOP_HIT",
+                            "price": exit_price, "pnl_pct": round(pnl_pct, 2),
+                        })
                     elif exit_reason == "TARGET":
                         counts["targeted"] += 1
+                        events.append({
+                            "symbol": stock, "event": "TARGET_HIT",
+                            "price": exit_price, "pnl_pct": round(pnl_pct, 2),
+                        })
                     else:
                         counts["expired"] += 1
+                        events.append({
+                            "symbol": stock, "event": "EXPIRED",
+                            "price": exit_price, "pnl_pct": round(pnl_pct, 2),
+                        })
 
                     logger.info(
                         f"{stock}: ACTIVE→CLOSED ({exit_reason}) | "
@@ -296,6 +332,7 @@ def update_trade_states(check_date: date) -> Dict[str, int]:
         f"expired={counts['expired']} | stopped={counts['stopped']} | "
         f"targeted={counts['targeted']} | unchanged={counts['unchanged']}"
     )
+    counts["events"] = events
     return counts
 
 

@@ -271,27 +271,37 @@ def _record_alerts(alerts: List[HealthAlert], run_date: date) -> None:
 
 
 async def _send_telegram_alert(alerts: List[HealthAlert]) -> None:
-    """Send critical alerts via Telegram."""
+    """
+    Send critical alerts via Telegram, routed through the shared
+    app/notifications/telegram module so chunking, retry, and the
+    Markdown-parse-error fallback are handled in one place instead
+    of duplicated here.
+    """
     critical = [a for a in alerts if a.severity == "CRITICAL"]
     if not critical or not settings.telegram_enabled:
         return
 
     try:
-        import httpx
-        lines = ["🚨 *SSP Health Alert*\n"]
+        from app.notifications.telegram import send_health_alert
+
+        # One combined message rather than one send per alert — keeps
+        # a multi-alert run as a single chat notification instead of
+        # spamming several messages back to back.
+        lines = []
         for a in critical:
             lines.append(f"❗ *{a.metric}*: {a.message}")
             lines.append(f"   Action: {a.action}\n")
-        message = "\n".join(lines)
+        combined_message = "\n".join(lines)
 
-        url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, json={
-                "chat_id": settings.telegram_chat_id,
-                "text": message,
-                "parse_mode": "Markdown",
-            })
-        logger.info(f"Sent {len(critical)} critical alerts via Telegram")
+        ok = await send_health_alert(
+            severity="CRITICAL",
+            metric=f"{len(critical)} alert(s)",
+            message=combined_message,
+        )
+        if ok:
+            logger.info(f"Sent {len(critical)} critical alerts via Telegram")
+        else:
+            logger.warning("Telegram health alert send failed")
     except Exception as e:
         logger.error(f"Failed to send health alert: {e}")
 

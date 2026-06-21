@@ -6,6 +6,12 @@ Responsibilities:
   21.1 Position Sizing  — RiskBased → StockCap → LiquidityCap (min of 3)
   21.2 Portfolio Constraints — max positions, sector cap, total risk cap
   21.3 Signal Prioritization — rank by RiskAdjustedScore, apply penalties
+  23.2 Cross-Stock Correlation — penalize signals on stocks that move
+       together (e.g. two PSU banks), so position sizing doesn't treat
+       two correlated bets as independent risk. This is distinct from
+       app/correlation/engine.py, which penalizes correlated *strategies*
+       within a single stock at the fusion stage — this operates one
+       level up, across *stocks*, at the portfolio stage.
 
 Flow:
   FusedSignal[] → PortfolioManager.run() → PortfolioResult
@@ -16,8 +22,10 @@ Flow:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 
 from app.db import get_sync_db
 from app.fusion.engine import FusedSignal
@@ -39,7 +47,110 @@ ADV_CAP_PCT         = 0.05    # order ≤ 5% of avg daily volume value
 
 # Prioritization penalties (Section 21.3)
 SAME_SECTOR_PENALTY = 0.20    # 20% score penalty beyond first in sector
-CORRELATION_PENALTY = 0.15    # 15% penalty for high correlation (§23 future)
+
+# ── Section 23.2: Cross-stock correlation penalty ──────────────
+# Distinct from app/correlation/engine.py's intra-stock strategy penalty.
+# Uses rolling price-return correlation between two stocks both carrying
+# a BUY signal today — if they move together, sizing both at full size
+# understates the portfolio's real concentration risk.
+CROSS_STOCK_ROLLING_DAYS   = 60     # same window as strategy correlation (Section 23.1)
+CROSS_STOCK_CORR_THRESHOLD = 0.7    # same threshold as Section 23.1
+CROSS_STOCK_MAX_PENALTY    = 0.15   # 15% — matches the original (now-removed) flat constant
+CROSS_STOCK_MIN_SAMPLES    = 20     # need at least this many overlapping days
+
+
+def _fetch_return_series(stock: str, as_of_date: date, window_days: int) -> Optional[np.ndarray]:
+    """Fetch daily returns for a stock over the rolling window, for correlation calc."""
+    cutoff = as_of_date - timedelta(days=window_days)
+    try:
+        with get_sync_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT date, close FROM market_data
+                WHERE stock = %s AND date BETWEEN %s AND %s
+                ORDER BY date ASC
+                """,
+                (stock, cutoff, as_of_date),
+            )
+            rows = cursor.fetchall()
+    except Exception as e:
+        logger.warning(f"Could not fetch return series for {stock}: {e}")
+        return None
+
+    if len(rows) < CROSS_STOCK_MIN_SAMPLES + 1:
+        return None
+
+    closes  = np.array([float(r["close"]) for r in rows])
+    returns = np.diff(closes) / closes[:-1]
+    return returns
+
+
+def _pairwise_correlation(stock_a: str, stock_b: str, as_of_date: date) -> Optional[float]:
+    """
+    Pearson correlation between two stocks' daily returns over the
+    rolling window. Returns None if insufficient overlapping history.
+    """
+    ra = _fetch_return_series(stock_a, as_of_date, CROSS_STOCK_ROLLING_DAYS)
+    rb = _fetch_return_series(stock_b, as_of_date, CROSS_STOCK_ROLLING_DAYS)
+    if ra is None or rb is None:
+        return None
+
+    n = min(len(ra), len(rb))
+    if n < CROSS_STOCK_MIN_SAMPLES:
+        return None
+    ra, rb = ra[-n:], rb[-n:]
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r = np.corrcoef(ra, rb)[0, 1]
+    if np.isnan(r):
+        return None
+    return float(r)
+
+
+def _cross_stock_penalty(r: float) -> float:
+    """
+    Same linear scaling shape as Section 23.1's dynamic penalty:
+    0 at threshold (0.7), CROSS_STOCK_MAX_PENALTY at r=1.0.
+    """
+    r = abs(r)
+    if r <= CROSS_STOCK_CORR_THRESHOLD:
+        return 0.0
+    r = min(r, 1.0)
+    return CROSS_STOCK_MAX_PENALTY * (r - CROSS_STOCK_CORR_THRESHOLD) / (1.0 - CROSS_STOCK_CORR_THRESHOLD)
+
+
+def apply_cross_stock_correlation_penalty(
+    candidates: List[str],
+    accepted_so_far: List[str],
+    as_of_date: date,
+) -> Dict[str, Tuple[float, Optional[str]]]:
+    """
+    For each candidate stock not yet accepted, find its worst-case
+    correlation against stocks already accepted into the portfolio today.
+    Returns {stock: (penalty_fraction, worst_correlated_with)}.
+
+    Called incrementally during signal selection (Section 21.3), so each
+    new acceptance can penalize the *remaining* candidates — this is why
+    it takes `accepted_so_far` rather than operating on the full batch
+    at once like the intra-stock correlation engine does.
+    """
+    result: Dict[str, Tuple[float, Optional[str]]] = {}
+    for stock in candidates:
+        worst_pen = 0.0
+        worst_with = None
+        for other in accepted_so_far:
+            if other == stock:
+                continue
+            r = _pairwise_correlation(stock, other, as_of_date)
+            if r is None:
+                continue
+            pen = _cross_stock_penalty(r)
+            if pen > worst_pen:
+                worst_pen = pen
+                worst_with = other
+        result[stock] = (worst_pen, worst_with)
+    return result
 
 
 @dataclass
@@ -352,22 +463,46 @@ class PortfolioManager:
                 )
                 continue
 
-            # ── Total risk cap check ──────────────────────────
-            risk_after = running_risk + ps.risk_pct_portfolio
+            # ── Section 23.2: Cross-stock correlation penalty ─────
+            # Stocks already accepted this round + active positions both
+            # count as "in the portfolio" for correlation purposes — a new
+            # signal correlated with either an existing holding or another
+            # signal accepted earlier today contributes effective risk
+            # beyond its own position size.
+            already_in_portfolio = [s.symbol for s in accepted_buy] + [p["stock"] for p in active]
+            corr_pen, corr_with = 0.0, None
+            if already_in_portfolio:
+                corr_map = apply_cross_stock_correlation_penalty(
+                    candidates=[signal.symbol],
+                    accepted_so_far=already_in_portfolio,
+                    as_of_date=self.run_date,
+                )
+                corr_pen, corr_with = corr_map[signal.symbol]
+
+            # Effective risk used for the total-risk-cap check is grossed
+            # up by the correlation penalty — a correlated position eats
+            # into the risk budget as if it were partially a duplicate bet.
+            effective_risk_pct = ps.risk_pct_portfolio * (1 + corr_pen)
+
+            # ── Total risk cap check (using correlation-adjusted risk) ──
+            risk_after = running_risk + effective_risk_pct
             if risk_after > MAX_TOTAL_RISK_PCT:
+                reason = f"TOTAL_RISK_CAP (would be {risk_after:.1%})"
+                if corr_pen > 0:
+                    reason += f" [corr_adj +{corr_pen:.0%} vs {corr_with}]"
                 result.rejected.append(RejectedSignal(
                     symbol=signal.symbol, signal=signal.signal,
-                    score=signal.fused_score,
-                    reason=f"TOTAL_RISK_CAP (would be {risk_after:.1%})"
+                    score=signal.fused_score, reason=reason,
                 ))
                 logger.info(
                     f"{signal.symbol}: rejected — total risk cap "
                     f"({risk_after:.1%} > {MAX_TOTAL_RISK_PCT:.0%})"
+                    + (f" [correlation +{corr_pen:.0%} vs {corr_with}]" if corr_pen > 0 else "")
                 )
                 continue
 
             # ── Accepted ──────────────────────────────────────
-            running_risk    += ps.risk_pct_portfolio
+            running_risk    += effective_risk_pct
             sector_value_new[sector] = sector_val_after
 
             # Attach position sizing to signal
@@ -375,13 +510,19 @@ class PortfolioManager:
             signal.position_value_inr   = ps.position_value_inr
             signal.risk_amount_inr      = ps.risk_amount_inr
 
+            if corr_pen > 0:
+                penalties = list(penalties) + [
+                    f"cross-stock correlation +{corr_pen:.0%} effective risk (vs {corr_with})"
+                ]
+
             if penalties:
                 signal.reasons.append(f"Portfolio penalties: {' | '.join(penalties)}")
             signal.reasons.append(
                 f"Position: {ps.final_shares} shares × ₹{signal.entry_price:,.1f} "
                 f"= ₹{ps.position_value_inr:,.0f} | "
-                f"risk=₹{ps.risk_amount_inr:,.0f} ({ps.risk_pct_portfolio:.2%}) | "
-                f"constraint={ps.binding_constraint}"
+                f"risk=₹{ps.risk_amount_inr:,.0f} ({ps.risk_pct_portfolio:.2%}"
+                + (f", effective {effective_risk_pct:.2%} w/ correlation" if corr_pen > 0 else "")
+                + f") | constraint={ps.binding_constraint}"
             )
 
             accepted_buy.append(signal)
