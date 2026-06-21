@@ -230,6 +230,24 @@ if page == "Today's Signals":
     if selected_stock != "ALL":
         filtered = filtered[filtered["stock"] == selected_stock]
 
+# TRIAL BLOCK starts here
+    display_cols = [
+        "date",
+        "stock",
+        "signal",
+        "confidence_pct",
+        "entry_price_theoretical",
+        "exit_target_theoretical",
+        "stop_loss_theoretical",
+        "regime",
+        "valid_until",
+        "created_at",
+    ]
+
+    filtered = filtered[display_cols]
+
+# TRIAL BLOCK ends here
+
     st.dataframe(filtered, use_container_width=True)
 
     csv = filtered.to_csv(index=False)
