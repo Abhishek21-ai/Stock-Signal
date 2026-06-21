@@ -1,5 +1,7 @@
 """
 Signal Fusion Engine — Section 9
+Now includes Section 23 dynamic correlation penalty, applied to
+regime weights before the weighted-sum step.
 
 Exports (matched to test_fusion.py):
   fuse()               — fuse single stock → FusedSignal
@@ -18,6 +20,7 @@ from app.regime.detector import RegimeResult, REGIME_WEIGHTS
 from app.strategies.base import StrategyResult, score_to_signal
 from app.db import get_sync_db
 from app.logger import get_logger
+from app.correlation.engine import apply_correlation_penalty   # ── NEW (Section 23)
 
 logger = get_logger("fusion")
 
@@ -43,6 +46,7 @@ class FusedSignal:
     disagreement_penalty_applied: bool = False
     low_confidence_skipped:       List[str] = field(default_factory=list)
     run_date:                     Optional[date] = None
+    correlation_adjusted:         bool = False        # ── NEW (Section 23)
 
     def to_dict(self) -> Dict:
         return {
@@ -55,6 +59,7 @@ class FusedSignal:
             "stop_loss":   self.stop_loss,
             "target_price": self.target_price,
             "reasons":     self.reasons,
+            "correlation_adjusted": self.correlation_adjusted,
             **{f"{k}_score": round(v, 2) for k, v in self.strategy_scores.items()},
         }
 
@@ -67,7 +72,7 @@ def fuse(
     features:         Optional[Dict] = None,
     save_to_db:       bool = True,
 ) -> FusedSignal:
-    weights = regime_result.fusion_weights
+    base_weights = regime_result.fusion_weights
     regime  = regime_result.regime
     reasons = []
     skipped = []
@@ -91,6 +96,20 @@ def fuse(
             regime=regime, reasons=["All strategies below confidence gate"],
             run_date=run_date,
         )
+
+    # ── 1b. Section 23: Dynamic correlation penalty ───────────
+    # Strategies that fired (passed confidence gate) are "active" for
+    # the purpose of the static co-fire check and correlation lookup.
+    active_strategy_ids = {r.strategy_id for r in eligible}
+    weights, corr_notes = apply_correlation_penalty(
+        stock=symbol,
+        base_weights=base_weights,
+        active_strategies=active_strategy_ids,
+        as_of_date=run_date,
+    )
+    correlation_adjusted = len(corr_notes) > 0
+    if corr_notes:
+        reasons.append("Correlation penalty (Section 23): " + "; ".join(corr_notes))
 
     # ── 2. Weighted fusion ────────────────────────────────────
     strategy_scores: Dict[str, float] = {}
@@ -165,11 +184,13 @@ def fuse(
         disagreement_penalty_applied=disagree_penalty,
         low_confidence_skipped=skipped,
         run_date=run_date,
+        correlation_adjusted=correlation_adjusted,
     )
 
     logger.info(
         f"{symbol} | {signal} | score={fused:+.1f} | conf={confidence:.0f}% | "
-        f"regime={regime} | bull={bull_count} bear={bear_count}"
+        f"regime={regime} | bull={bull_count} bear={bear_count} | "
+        f"corr_adj={correlation_adjusted}"
     )
 
     if save_to_db:

@@ -74,6 +74,7 @@ class DailyPipeline:
             await self._timed_stage("regime",            self._run_regime)
             await self._timed_stage("strategies",        self._run_strategies)
             await self._timed_stage("fusion",            self._run_fusion)
+            await self._timed_stage("correlation",       self._run_correlation)
             await self._timed_stage("llm",               self._run_llm)
             await self._timed_stage("microstructure",    self._run_microstructure)
             await self._timed_stage("execution_realism", self._run_execution_realism)
@@ -194,6 +195,30 @@ class DailyPipeline:
             f"SELL={sum(1 for s in self.ctx.fused_signals if 'SELL' in s.signal)} | "
             f"HOLD={sum(1 for s in self.ctx.fused_signals if s.signal == 'HOLD')}"
         )
+
+    # ── Stage 5b: Strategy Correlation Update ─────────────────
+
+    async def _run_correlation(self) -> None:
+        """
+        Section 23: Recompute rolling 60-day strategy correlation matrix
+        for each stock and store it. The Fusion stage that already ran
+        this cycle uses YESTERDAY's matrix (correlations are inherently
+        backward-looking); this stage refreshes today's matrix for
+        TOMORROW's fusion run.
+        """
+        from app.correlation.engine import CorrelationEngine
+
+        def _run():
+            engine = CorrelationEngine(run_date=self.ctx.run_date)
+            return engine.run(self.ctx.stocks)
+
+        results = await asyncio.get_event_loop().run_in_executor(None, _run)
+        updated = sum(1 for v in results.values() if v)
+        logger.info(
+            f"Correlation: {updated}/{len(self.ctx.stocks)} matrices updated "
+            f"(others have <60d history)"
+        )
+
 
     # ── Stage 6: LLM Override ────────────────────────────────
 
