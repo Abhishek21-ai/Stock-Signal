@@ -6,6 +6,7 @@ from typing import Dict
 
 WATCHLIST_WITH_SECTORS: Dict[str, str] = {
     "RELIANCE":    "Energy",
+    "VEDL":        "Metals",
     "TCS":         "IT",
     "HDFCBANK":    "Banking",
     "INFY":        "IT",

@@ -21,6 +21,7 @@ from app.strategies.base import StrategyResult, score_to_signal
 from app.db import get_sync_db
 from app.logger import get_logger
 from app.correlation.engine import apply_correlation_penalty   # ── NEW (Section 23)
+from app.regime.vol_adjuster import adjust_weights as vol_adjust_weights  # ── Vol-structure adjustment
 
 logger = get_logger("fusion")
 
@@ -97,13 +98,26 @@ def fuse(
             run_date=run_date,
         )
 
-    # ── 1b. Section 23: Dynamic correlation penalty ───────────
+    # ── 1b. Volatility-structure weight adjustment ────────────
+    # Adjusts regime weights per-stock using 3 metrics:
+    #   1. 30d realized vol   — low-vol stocks get less trend/breakout
+    #   2. ADX                — weak trend stocks get less trend/breakout
+    #   3. Return autocorr    — mean-reverting stocks get more reversion
+    vol_weights, vol_notes = vol_adjust_weights(
+        symbol=symbol,
+        base_weights=base_weights,
+        features=features or {},
+    )
+    if vol_notes:
+        reasons.append("Vol-structure adj: " + " | ".join(vol_notes))
+
+    # ── 1c. Section 23: Dynamic correlation penalty ───────────
     # Strategies that fired (passed confidence gate) are "active" for
     # the purpose of the static co-fire check and correlation lookup.
     active_strategy_ids = {r.strategy_id for r in eligible}
     weights, corr_notes = apply_correlation_penalty(
         stock=symbol,
-        base_weights=base_weights,
+        base_weights=vol_weights,     # use vol-adjusted weights as input
         active_strategies=active_strategy_ids,
         as_of_date=run_date,
     )

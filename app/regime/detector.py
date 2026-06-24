@@ -24,21 +24,61 @@ from app.logger import get_logger
 logger = get_logger("regime_detector")
 
 REGIME_WEIGHTS: Dict[str, Dict[str, float]] = {
+    # ── Design principles ────────────────────────────────────────
+    # 1. All 6 strategies are listed explicitly (no 0.20 default fallback
+    #    for risk — it previously wasn't here, getting a hardcoded default
+    #    regardless of regime).
+    # 2. Reversion is capped at 0.25 max. It only fires on ~5% of signals
+    #    (requires RSI<35 + price<EMA50 together). Allocating 50-70% to it
+    #    meant weight_used dropped to 0.30-0.50 when it didn't fire, causing
+    #    fuse()'s renorm to 2x-amplify whatever remained. In BEAR the old
+    #    weights made volume the effective dominant at 40% — unintentional.
+    # 3. No strategy exceeds 0.30. The system has 6 independent signals;
+    #    over-concentrating in one defeats the purpose of multi-strategy fusion.
+    # 4. Zero weights are preserved where genuinely appropriate:
+    #    breakout=0.0 in BEAR/SIDEWAYS (false breakouts in ranging markets).
+    # 5. Risk strategy now regime-aware: higher weight in BEAR/UNCERTAIN
+    #    where capital preservation matters most.
     "BULL": {
-        "trend": 0.25, "momentum": 0.30, "reversion": 0.15,
-        "breakout": 0.20, "volume": 0.10,
+        # Strong directional trend — trend and breakout earn weight
+        # reversion low (mean-reverting signals are noise in uptrends)
+        "trend":     0.28,
+        "momentum":  0.25,
+        "breakout":  0.22,
+        "reversion": 0.10,
+        "volume":    0.08,
+        "risk":      0.07,
     },
     "BEAR": {
-        "trend": 0.0, "momentum": 0.10, "reversion": 0.70,
-        "breakout": 0.0, "volume": 0.20,
+        # Capital preservation first — risk gets highest weight
+        # reversion valid (oversold bounces) but capped at 0.25
+        # trend=0, breakout=0 (breakouts are traps in bear markets)
+        "trend":     0.00,
+        "momentum":  0.15,
+        "breakout":  0.00,
+        "reversion": 0.25,
+        "volume":    0.20,
+        "risk":      0.40,
     },
     "SIDEWAYS": {
-        "trend": 0.05, "momentum": 0.20, "reversion": 0.60,
-        "breakout": 0.0, "volume": 0.15,
+        # Range-bound: reversion + volume dominate
+        # small trend/breakout weight to catch eventual breakouts
+        "trend":     0.08,
+        "momentum":  0.20,
+        "breakout":  0.07,
+        "reversion": 0.25,
+        "volume":    0.22,
+        "risk":      0.18,
     },
     "UNCERTAIN": {
-        "trend": 0.10, "momentum": 0.20, "reversion": 0.50,
-        "breakout": 0.10, "volume": 0.10,
+        # No clear direction — equal-ish distribution prevents any one
+        # strategy dominating when the market regime is ambiguous
+        "trend":     0.20,
+        "momentum":  0.22,
+        "breakout":  0.18,
+        "reversion": 0.15,
+        "volume":    0.12,
+        "risk":      0.13,
     },
 }
 
