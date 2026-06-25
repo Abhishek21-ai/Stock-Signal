@@ -96,7 +96,41 @@ class MeanReversionStrategy(BaseStrategy):
             score *= 0.7
             reasons.append(f"Moderate trend ADX={adx:.1f} — reducing reversion confidence")
 
-        # ── 5. Regime weight ──────────────────────────────────
+        # ── 5. EMA trend filter — no long reversion in bear structure (Fix B)
+        # Mean reversion BUY only makes sense when price structure is neutral
+        # or recovering. In a confirmed downtrend (EMA20 < EMA50 < EMA200),
+        # oversold stocks often become more oversold (falling knife).
+        # Only suppress LONG (positive) reversion scores — short reversion
+        # (overbought in uptrend) is still valid.
+        ema_20  = features.get("ema_20",  close) or close
+        ema_50  = features.get("ema_50",  close) or close
+        ema_200 = features.get("ema_200", close) or close
+
+        bear_alignment = ema_20 < ema_50 and ema_50 < ema_200
+        bull_alignment = ema_20 > ema_50 and ema_50 > ema_200
+
+        if score > 0 and bear_alignment:
+            # Full bear EMA stack — buying reversion into downtrend is dangerous
+            score *= 0.25
+            reasons.append(
+                f"EMA bear stack (EMA20={ema_20:.0f}<EMA50={ema_50:.0f}<EMA200={ema_200:.0f}) "
+                f"— suppressing reversion long (catching falling knife risk)"
+            )
+        elif score > 0 and ema_20 < ema_50:
+            # Partial bear alignment — reduce but don't eliminate
+            score *= 0.55
+            reasons.append(
+                f"EMA20 < EMA50 ({ema_20:.0f} < {ema_50:.0f}) "
+                f"— reducing reversion long confidence"
+            )
+        elif score < 0 and bull_alignment:
+            # Full bull EMA stack — shorting reversion into uptrend is dangerous
+            score *= 0.25
+            reasons.append(
+                f"EMA bull stack — suppressing reversion short (fading bull trend risk)"
+            )
+
+        # ── 6. Regime weight ──────────────────────────────────
         weight = REGIME_WEIGHTS.get(regime, 1.1)
         score  = max(-100, min(100, score * weight))
 

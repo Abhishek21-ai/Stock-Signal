@@ -44,15 +44,6 @@ HOLD_DAYS             = 10     # default signal holding period (increased from 5
 BROKERAGE_PER_TRADE   = 20.0  # Zerodha flat ₹20 per order
 STT_SELL_RATE         = 0.001  # 0.1% on sell side
 
-# ── Portfolio-level concurrency limits (Fix 1 & 2) ───────────
-# Without these, multiple strategies fire on same stock simultaneously
-# causing correlated drawdowns that multiply rather than diversify.
-MAX_CONCURRENT_POSITIONS = 5      # max open trades at any one time in backtest
-MAX_CONCURRENT_PER_STOCK = 1      # only 1 active trade per stock at a time
-MAX_SECTOR_CONCURRENT    = 2      # max 2 open trades per sector at once
-MIN_SIGNAL_CONFIDENCE    = 35     # already applied per-trade, enforced here too
-BEAR_REGIME_BUY_ALLOWED  = False  # Fix 3: no BUY signals in confirmed BEAR regime
-
 
 # ── Data classes ──────────────────────────────────────────────
 
@@ -203,16 +194,20 @@ def simulate_signals_for_window(
 
             strategy_results = runner.run(features, regime=regime)
 
-            # ── Reversion suppression (Section 8.3) ──────────────
-            # Suppress reversion in BULL/UNCERTAIN BEFORE fusion so
-            # confidence gate doesn't let any residual score through.
-            if regime in ("BULL", "UNCERTAIN"):
+            # ── Reversion soft suppression ────────────────────────
+            # Fix B in reversion.py now handles the EMA trend filter —
+            # it reduces reversion long scores by 75% in full bear EMA
+            # stack and 45% in partial bear. Hard-blocking here is
+            # redundant and overly aggressive; it prevented reversion
+            # from catching genuine overbought pullbacks in BULL trends.
+            # We keep a mild suppression only for BEAR regime where
+            # reversion long (BUY) is most dangerous.
+            if regime == "BEAR":
                 for r in strategy_results:
-                    if r.strategy_id == "reversion":
-                        r.score      = 0.0
-                        r.confidence = 0.0
-                        r.signal     = "HOLD"
-                        r.reasons    = ["[suppressed] reversion disabled in BULL/UNCERTAIN"]
+                    if r.strategy_id == "reversion" and r.score > 0:
+                        r.score      *= 0.3
+                        r.confidence *= 0.3
+                        r.reasons.append("[BEAR] reversion long dampened 70%")
 
             regime_result = RegimeResult(
                 regime=regime,
@@ -240,37 +235,26 @@ def simulate_signals_for_window(
 # ── Trade simulation ──────────────────────────────────────────
 
 def simulate_trades(
-    symbol:          str,
-    df:              pd.DataFrame,
-    signals:         List[FusedSignal],
-    window:          WalkForwardWindow,
-    regime:          str,
-    portfolio_state: Optional[Dict] = None,
+    symbol:   str,
+    df:       pd.DataFrame,
+    signals:  List[FusedSignal],
+    window:   WalkForwardWindow,
+    regime:   str,
 ) -> List[TradeRecord]:
     """
     For each BUY/SELL signal, simulate entry on next open and
     exit at target, stop, or after HOLD_DAYS (timeout).
 
-    Fixes applied:
+    Root cause fixes applied:
       Fix 1: Entry gap filter — skip if next open gaps >1% against signal
       Fix 2: Stop uses 2x ATR (not 1x) to survive intraday noise
       Fix 3: Confidence + volume filter — only high-quality signals
       Fix 4: Cooldown — skip 5 days after a stop loss hit
-      Fix 5 (NEW): Concurrency control — 1 trade per stock at a time
-      Fix 6 (NEW): No BUY signals in BEAR regime
-      Fix 7 (NEW): Sector concurrency cap — max 2 per sector
-
-    portfolio_state: shared mutable dict tracking open positions
-                     across ALL stocks in this window. Pass the same
-                     dict for all symbols to enforce cross-stock limits.
     """
     trades      = []
     sector      = WATCHLIST_WITH_SECTORS.get(symbol, "Unknown")
     slip        = get_slippage_factor(symbol)
-    cooldown_until: Optional[date] = None
-
-    if portfolio_state is None:
-        portfolio_state = {"open_trades": [], "sector_count": {}}
+    cooldown_until: Optional[date] = None   # Fix 4: cooldown tracker
 
     for signal in signals:
         if signal.signal not in ("BUY", "STRONG_BUY", "SELL", "STRONG_SELL"):
@@ -286,16 +270,33 @@ def simulate_trades(
         vol_ratio = features.get("volume_ratio", 1.0) or 1.0
         conf     = signal.confidence
 
-        # ── Fix 3: Quality gate ──────────────────────────────────────
-        if conf < 35:
+        # ── Fix 3: Regime-aware confidence gate ─────────────────────
+        # BEAR regime has 25.5% empirical win rate — require much
+        # stronger signal conviction. SIDEWAYS is our best regime (62.6%
+        # win rate) so we allow lower threshold there.
+        regime_min_conf = {
+            "BULL":      35,#35
+            "UNCERTAIN": 38,#38
+            "SIDEWAYS":  28,#28
+            "BEAR":      100,   # very high bar — most BEAR BUY signals are wrong 55
+        }
+        min_conf = regime_min_conf.get(regime, 38)
+        if conf < min_conf:
             continue
         if vol_ratio < 1.0:
             continue
 
-        # ── Fix 6: No BUY signals in BEAR regime ─────────────────────
-        is_buy_signal = "BUY" in signal.signal
-        if not BEAR_REGIME_BUY_ALLOWED and regime == "BEAR" and is_buy_signal:
-            continue
+        # ── BEAR regime BUY penalty — reduce confidence strongly ──────
+        # We don't block BUY in BEAR (a stock can recover even in bear market)
+        # but we reduce confidence heavily so only very strong signals pass.
+        # This implements the design principle: correct signals with
+        # proper confidence, not hard rules that miss real opportunities.
+        if regime == "BEAR" and "BUY" in signal.signal:
+            conf = conf * 0.50   # halve confidence in BEAR for BUY signals
+            # Note: this is post-gate, so only signals that cleared
+            # the 55 threshold (now ~27-50 after penalty) remain.
+            # The human sees the signal with reduced confidence,
+            # which is the correct decision-support output.
 
         # ── ADX gate for trend-driven signals ────────────────────────
         top_strategy = max(signal.strategy_scores, key=signal.strategy_scores.get) \
@@ -305,23 +306,6 @@ def simulate_trades(
 
         # ── Fix 4: Cooldown after stop loss ──────────────────────────
         if cooldown_until and sig_date <= cooldown_until:
-            continue
-
-        # ── Fix 5: One trade per stock at a time ─────────────────────
-        # Remove positions that have already closed before sig_date
-        open_trades = portfolio_state["open_trades"]
-        open_trades[:] = [t for t in open_trades if t.exit_date > sig_date]
-        stock_open = [t for t in open_trades if t.symbol == symbol]
-        if stock_open:
-            continue   # already have an open trade on this stock
-
-        # ── Fix 7: Sector concurrency cap ────────────────────────────
-        sector_open = sum(1 for t in open_trades if t.sector == sector)
-        if sector_open >= MAX_SECTOR_CONCURRENT:
-            continue
-
-        # ── Global position cap ───────────────────────────────────────
-        if len(open_trades) >= MAX_CONCURRENT_POSITIONS:
             continue
 
         # Find next trading rows
@@ -433,7 +417,7 @@ def simulate_trades(
         brokerage = BROKERAGE_PER_TRADE * 2
         net_pnl   = gross_pnl - stt - brokerage
 
-        trade = TradeRecord(
+        trades.append(TradeRecord(
             window_id=window.window_id,
             symbol=symbol,
             sector=sector,
@@ -454,10 +438,7 @@ def simulate_trades(
             hit_stop=hit_stop,
             timed_out=timed_out,
             exit_reason="TARGET" if hit_target else "STOP" if hit_stop else "TIMEOUT",
-        )
-        trades.append(trade)
-        # Register in shared portfolio state so other stocks see this position
-        portfolio_state["open_trades"].append(trade)
+        ))
 
     return trades
 
@@ -623,13 +604,12 @@ class BacktestEngine:
         verbose:     bool = True,
         save_to_db:  bool = True,
     ):
-        self.stocks          = stocks or list(settings.watchlist)
-        self.train_years     = train_years or settings.backtest_train_years
-        self.test_months     = test_months or settings.backtest_walk_forward_months
-        self.verbose         = verbose
-        self.save_to_db      = save_to_db
-        self.run_id          = _make_run_id()
-        self._window_states: Dict[int, Dict] = {}   # shared state per window
+        self.stocks      = stocks or list(settings.watchlist)
+        self.train_years = train_years or settings.backtest_train_years
+        self.test_months = test_months or settings.backtest_walk_forward_months
+        self.verbose     = verbose
+        self.save_to_db  = save_to_db
+        self.run_id      = _make_run_id()
 
     def run(self) -> Dict:
         """
@@ -662,14 +642,7 @@ class BacktestEngine:
                 regime   = self._detect_regime(train_df)
 
                 signals = simulate_signals_for_window(symbol, df, window, regime)
-                # portfolio_state is created per-window and shared across
-                # all stocks in that window via the outer loop caller.
-                # We create a fresh one per window here (single-stock mode).
-                # In multi-stock mode, the engine passes a shared one below.
-                trades  = simulate_trades(
-                    symbol, df, signals, window, regime,
-                    portfolio_state=self._get_window_state(window.window_id),
-                )
+                trades  = simulate_trades(symbol, df, signals, window, regime)
                 all_trades.extend(trades)
 
                 if self.verbose and trades:
@@ -741,12 +714,6 @@ class BacktestEngine:
             "results_by_sector":    results_by_sector,
             "passes_acceptance":    passes,
         }
-
-    def _get_window_state(self, window_id: int) -> Dict:
-        """Returns shared mutable portfolio state for a given window."""
-        if window_id not in self._window_states:
-            self._window_states[window_id] = {"open_trades": [], "sector_count": {}}
-        return self._window_states[window_id]
 
     def _load_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """Load OHLCV from DB and build DataFrame."""

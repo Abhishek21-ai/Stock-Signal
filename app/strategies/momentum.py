@@ -105,7 +105,26 @@ class MomentumStrategy(BaseStrategy):
             score -= 8
             reasons.append(f"Price {price_vs_vwap:.1%} below VWAP")
 
-        # ── 5. Regime weight ──────────────────────────────────
+        # ── 5. ADX confirmation gate (Fix A) ─────────────────
+        # Momentum signals require actual directional movement to be valid.
+        # RSI/Stochastic reaching extreme levels during a low-ADX drift
+        # (common in IT stocks between earnings) produces false signals.
+        # Without trend confirmation, these are noise, not momentum.
+        adx = features.get("adx_14", 0) or 0
+        if adx < 15:
+            # Flat market — momentum signals are near-random, halve score
+            score *= 0.4
+            reasons.append(f"ADX={adx:.1f} < 15 — no trend, momentum signal unreliable")
+        elif adx < 20:
+            score *= 0.65
+            reasons.append(f"ADX={adx:.1f} < 20 — weak trend, reducing momentum confidence")
+        elif adx > 28:
+            # Strong trend confirms momentum signal is genuine
+            score *= 1.15
+            score  = max(-100, min(100, score))
+            reasons.append(f"ADX={adx:.1f} > 28 — trend confirmed, momentum signal strengthened")
+
+        # ── 6. Regime weight ──────────────────────────────────
         weight = REGIME_WEIGHTS.get(regime, 0.9)
         score  = max(-100, min(100, score * weight))
 
