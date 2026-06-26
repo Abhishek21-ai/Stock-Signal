@@ -194,20 +194,16 @@ def simulate_signals_for_window(
 
             strategy_results = runner.run(features, regime=regime)
 
-            # ── Reversion soft suppression ────────────────────────
-            # Fix B in reversion.py now handles the EMA trend filter —
-            # it reduces reversion long scores by 75% in full bear EMA
-            # stack and 45% in partial bear. Hard-blocking here is
-            # redundant and overly aggressive; it prevented reversion
-            # from catching genuine overbought pullbacks in BULL trends.
-            # We keep a mild suppression only for BEAR regime where
-            # reversion long (BUY) is most dangerous.
-            if regime == "BEAR":
+            # ── Reversion suppression (Section 8.3) ──────────────
+            # Suppress reversion in BULL/UNCERTAIN BEFORE fusion so
+            # confidence gate doesn't let any residual score through.
+            if regime in ("BULL", "UNCERTAIN"):
                 for r in strategy_results:
-                    if r.strategy_id == "reversion" and r.score > 0:
-                        r.score      *= 0.3
-                        r.confidence *= 0.3
-                        r.reasons.append("[BEAR] reversion long dampened 70%")
+                    if r.strategy_id == "reversion":
+                        r.score      = 0.0
+                        r.confidence = 0.0
+                        r.signal     = "HOLD"
+                        r.reasons    = ["[suppressed] reversion disabled in BULL/UNCERTAIN"]
 
             regime_result = RegimeResult(
                 regime=regime,
@@ -285,18 +281,6 @@ def simulate_trades(
             continue
         if vol_ratio < 1.0:
             continue
-
-        # ── BEAR regime BUY penalty — reduce confidence strongly ──────
-        # We don't block BUY in BEAR (a stock can recover even in bear market)
-        # but we reduce confidence heavily so only very strong signals pass.
-        # This implements the design principle: correct signals with
-        # proper confidence, not hard rules that miss real opportunities.
-        if regime == "BEAR" and "BUY" in signal.signal:
-            conf = conf * 0.50   # halve confidence in BEAR for BUY signals
-            # Note: this is post-gate, so only signals that cleared
-            # the 55 threshold (now ~27-50 after penalty) remain.
-            # The human sees the signal with reduced confidence,
-            # which is the correct decision-support output.
 
         # ── ADX gate for trend-driven signals ────────────────────────
         top_strategy = max(signal.strategy_scores, key=signal.strategy_scores.get) \
