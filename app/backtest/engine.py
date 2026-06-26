@@ -307,13 +307,14 @@ def _build_candidates(
             continue
 
         entry_price = round(next_open * (1 + slip * 0.5), 2)
+        stop_mult = 2.0
 
         if is_long:
-            stop_loss = max(round(entry_price - 2.0 * atr, 2),
-                            round(entry_price * 0.96, 2))
+            stop_loss = round(entry_price - stop_mult * atr, 2)
+            stop_loss = max(stop_loss, round(entry_price * 0.93, 2))  # Relaxed to 7% floor
         else:
-            stop_loss = min(round(entry_price + 2.0 * atr, 2),
-                            round(entry_price * 1.04, 2))
+            stop_loss = round(entry_price + stop_mult * atr, 2)
+            stop_loss = min(stop_loss, round(entry_price * 1.02, 2))
 
         risk_per_share = abs(entry_price - stop_loss)
         if risk_per_share <= 0:
