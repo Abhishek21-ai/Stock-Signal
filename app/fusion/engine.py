@@ -27,7 +27,7 @@ logger = get_logger("fusion")
 
 AGREEMENT_BONUS      = 8
 DISAGREEMENT_PENALTY = 12
-CONFIDENCE_GATE      = 15.0
+CONFIDENCE_GATE      = 20.0  # raised from 15 — reversion now fires selectively
 SIGNAL_THRESHOLD     = 20.0
 
 

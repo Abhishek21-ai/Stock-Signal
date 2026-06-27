@@ -24,61 +24,39 @@ from app.logger import get_logger
 logger = get_logger("regime_detector")
 
 REGIME_WEIGHTS: Dict[str, Dict[str, float]] = {
-    # ── Design principles ────────────────────────────────────────
-    # 1. All 6 strategies are listed explicitly (no 0.20 default fallback
-    #    for risk — it previously wasn't here, getting a hardcoded default
-    #    regardless of regime).
-    # 2. Reversion is capped at 0.25 max. It only fires on ~5% of signals
-    #    (requires RSI<35 + price<EMA50 together). Allocating 50-70% to it
-    #    meant weight_used dropped to 0.30-0.50 when it didn't fire, causing
-    #    fuse()'s renorm to 2x-amplify whatever remained. In BEAR the old
-    #    weights made volume the effective dominant at 40% — unintentional.
-    # 3. No strategy exceeds 0.30. The system has 6 independent signals;
-    #    over-concentrating in one defeats the purpose of multi-strategy fusion.
-    # 4. Zero weights are preserved where genuinely appropriate:
-    #    breakout=0.0 in BEAR/SIDEWAYS (false breakouts in ranging markets).
-    # 5. Risk strategy now regime-aware: higher weight in BEAR/UNCERTAIN
-    #    where capital preservation matters most.
+    # All 6 strategies explicit — no more `weights.get(id, 0.20)` fallback
+    # for `risk`, which was previously missing and getting a flat 0.20
+    # regardless of regime (Sharpe 4.17 in backtest, yet invisible to
+    # regime logic). Reversion capped proportional to actual firing
+    # frequency (~5% of signals) so weight_used never drops below 0.75
+    # when reversion is absent — bounding renorm inflation to ≤1.33x
+    # instead of the previous 2.0x in BEAR/SIDEWAYS.
     "BULL": {
-        # Strong directional trend — trend and breakout earn weight
-        # reversion low (mean-reverting signals are noise in uptrends)
-        "trend":     0.28,
-        "momentum":  0.25,
-        "breakout":  0.22,
-        "reversion": 0.10,
-        "volume":    0.08,
-        "risk":      0.07,
+        # Trend + momentum lead in confirmed uptrends.
+        # Reversion minimal (rarely fires in bull, would fade real moves).
+        # Risk low — market is supportive, capital preservation less urgent.
+        "trend": 0.30, "momentum": 0.28, "reversion": 0.07,
+        "breakout": 0.18, "volume": 0.10, "risk": 0.07,
     },
     "BEAR": {
-        # Capital preservation first — risk gets highest weight
-        # reversion valid (oversold bounces) but capped at 0.25
-        # trend=0, breakout=0 (breakouts are traps in bear markets)
-        "trend":     0.00,
-        "momentum":  0.15,
-        "breakout":  0.00,
-        "reversion": 0.25,
-        "volume":    0.20,
-        "risk":      0.40,
+        # Risk is primary — capital preservation in downtrends.
+        # Reversion meaningful (oversold bounces are the main edge in bear).
+        # Trend/breakout zeroed — don't chase moves in bear markets.
+        "trend": 0.05, "momentum": 0.12, "reversion": 0.25,
+        "breakout": 0.00, "volume": 0.18, "risk": 0.40,
     },
     "SIDEWAYS": {
-        # Range-bound: reversion + volume dominate
-        # small trend/breakout weight to catch eventual breakouts
-        "trend":     0.08,
-        "momentum":  0.20,
-        "breakout":  0.07,
-        "reversion": 0.25,
-        "volume":    0.22,
-        "risk":      0.18,
+        # Reversion + risk split primary weight — mean-reversion works
+        # in range-bound markets, risk filter keeps quality high.
+        # Trend/breakout minimal — no sustained trend to follow.
+        "trend": 0.05, "momentum": 0.18, "reversion": 0.25,
+        "breakout": 0.05, "volume": 0.17, "risk": 0.30,
     },
     "UNCERTAIN": {
-        # No clear direction — equal-ish distribution prevents any one
-        # strategy dominating when the market regime is ambiguous
-        "trend":     0.20,
-        "momentum":  0.22,
-        "breakout":  0.18,
-        "reversion": 0.15,
-        "volume":    0.12,
-        "risk":      0.13,
+        # Equal-ish distribution with slight tilt to momentum + risk.
+        # No conviction on direction, so no strategy dominates.
+        "trend": 0.12, "momentum": 0.22, "reversion": 0.20,
+        "breakout": 0.10, "volume": 0.12, "risk": 0.24,
     },
 }
 

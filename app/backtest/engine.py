@@ -18,6 +18,7 @@ Key classes:
 from __future__ import annotations
 
 import math
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -178,8 +179,6 @@ def simulate_signals_for_window(
         (df.index.date <= window.test_end)
     ]
 
-    sector = WATCHLIST_WITH_SECTORS.get(symbol, "Unknown")
-
     for i, (ts, _) in enumerate(test_df.iterrows()):
         signal_date = ts.date()
 
@@ -195,8 +194,6 @@ def simulate_signals_for_window(
             strategy_results = runner.run(features, regime=regime)
 
             # ── Reversion suppression (Section 8.3) ──────────────
-            # Suppress reversion in BULL/UNCERTAIN BEFORE fusion so
-            # confidence gate doesn't let any residual score through.
             if regime in ("BULL", "UNCERTAIN"):
                 for r in strategy_results:
                     if r.strategy_id == "reversion":
@@ -230,27 +227,44 @@ def simulate_signals_for_window(
 
 # ── Trade simulation ──────────────────────────────────────────
 
-def simulate_trades(
+@dataclass
+class _Candidate:
+    window_id:     int
+    symbol:        str
+    sector:        str
+    signal:        str
+    regime:        str
+    strategy_id:   str
+    fused_score:   float          
+    entry_date:    date
+    exit_date:     date
+    entry_price:   float
+    exit_price:    float
+    stop_loss:     float
+    target_price:  float
+    is_long:       bool
+    slip:          float
+    shares:        int            
+    gross_pnl:     float          
+    net_pnl:       float
+    return_pct:    float
+    hit_target:    bool
+    hit_stop:      bool
+    timed_out:     bool
+    exit_reason:   str
+
+
+def _build_candidates(
     symbol:   str,
     df:       pd.DataFrame,
     signals:  List[FusedSignal],
     window:   WalkForwardWindow,
     regime:   str,
-) -> List[TradeRecord]:
-    """
-    For each BUY/SELL signal, simulate entry on next open and
-    exit at target, stop, or after HOLD_DAYS (timeout).
-
-    Root cause fixes applied:
-      Fix 1: Entry gap filter — skip if next open gaps >1% against signal
-      Fix 2: Stop uses 2x ATR (not 1x) to survive intraday noise
-      Fix 3: Confidence + volume filter — only high-quality signals
-      Fix 4: Cooldown — skip 5 days after a stop loss hit
-    """
-    trades      = []
-    sector      = WATCHLIST_WITH_SECTORS.get(symbol, "Unknown")
-    slip        = get_slippage_factor(symbol)
-    cooldown_until: Optional[date] = None   # Fix 4: cooldown tracker
+) -> List[_Candidate]:
+    candidates   = []
+    sector       = WATCHLIST_WITH_SECTORS.get(symbol, "Unknown")
+    slip         = get_slippage_factor(symbol)
+    cooldown_until: Optional[date] = None
 
     for signal in signals:
         if signal.signal not in ("BUY", "STRONG_BUY", "SELL", "STRONG_SELL"):
@@ -258,13 +272,13 @@ def simulate_trades(
         if not signal.entry_price:
             continue
 
-        sig_date = signal._signal_date
-        features = signal._features
-        close    = features.get("close", signal.entry_price)
-        atr      = features.get("atr_14", close * 0.02)
-        adx      = features.get("adx_14", 0)
+        sig_date  = signal._signal_date
+        features  = signal._features
+        close     = features.get("close", signal.entry_price)
+        atr       = features.get("atr_14", close * 0.02)
+        adx       = features.get("adx_14", 0)
         vol_ratio = features.get("volume_ratio", 1.0) or 1.0
-        conf     = signal.confidence
+        conf      = signal.confidence
 
         # ── Fix 3: Regime-aware confidence gate ─────────────────────
         # BEAR regime has 25.5% empirical win rate — require much
@@ -282,80 +296,61 @@ def simulate_trades(
         if vol_ratio < 1.0:
             continue
 
-        # ── ADX gate for trend-driven signals ────────────────────────
         top_strategy = max(signal.strategy_scores, key=signal.strategy_scores.get) \
             if signal.strategy_scores else "combined"
         if top_strategy == "trend" and adx < 20:
             continue
 
-        # ── Fix 4: Cooldown after stop loss ──────────────────────────
         if cooldown_until and sig_date <= cooldown_until:
             continue
 
-        # Find next trading rows
         future_rows = df[df.index.date > sig_date]
         if future_rows.empty:
             continue
 
-        # Next day open
-        has_open    = "Open" in future_rows.columns
-        next_open   = float(future_rows.iloc[0]["Open"]) if has_open else close
-        entry_date  = future_rows.index[0].date()
+        has_open   = "Open" in future_rows.columns
+        next_open  = float(future_rows.iloc[0]["Open"]) if has_open else close
+        entry_date = future_rows.index[0].date()
 
-        # ── Fix 1: Entry gap filter ───────────────────────────────────
-        # If next open gaps >1% against our signal direction, skip.
-        # Prevents chasing gapped entries where slippage kills expectancy.
         is_long = "BUY" in signal.signal
         gap_pct = (next_open - close) / close
-        if is_long  and gap_pct < -0.01:   # gapped down >1% on BUY signal
+        if is_long  and gap_pct < -0.01:
             continue
-        if not is_long and gap_pct > 0.01:  # gapped up >1% on SELL signal
+        if not is_long and gap_pct > 0.01:
             continue
 
         entry_price = round(next_open * (1 + slip * 0.5), 2)
-
-        # Position sizing from ATR-based risk
-        risk_inr = settings.portfolio_value_inr * settings.risk_per_trade_pct
-
-        # ── Fix 2: Stop at 2x ATR from entry ─────────────────────────
-        # 2x ATR survives normal intraday noise (avg H-L ~= 1x ATR).
-        # 4% max risk floor prevents catastrophic single-trade loss.
         stop_mult = 2.0
+
         if is_long:
             stop_loss = round(entry_price - stop_mult * atr, 2)
-            stop_loss = max(stop_loss, round(entry_price * 0.96, 2))  # 4% floor
+            stop_loss = max(stop_loss, round(entry_price * 0.93, 2))  # Relaxed to 7% floor
         else:
             stop_loss = round(entry_price + stop_mult * atr, 2)
-            stop_loss = min(stop_loss, round(entry_price * 1.04, 2))
+            stop_loss = min(stop_loss, round(entry_price * 1.02, 2))
 
         risk_per_share = abs(entry_price - stop_loss)
         if risk_per_share <= 0:
             continue
 
-        shares = max(1, int(risk_inr / risk_per_share))
-        shares = min(shares, int(
+        risk_inr = settings.portfolio_value_inr * settings.risk_per_trade_pct
+        shares   = max(1, int(risk_inr / risk_per_share))
+        shares   = min(shares, int(
             settings.portfolio_value_inr * settings.max_single_stock_pct / entry_price
         ))
 
-        # Target: 2.5x R:R → positive expectancy even at 45% WR
-        # At 45% WR + 2.5 R:R: expectancy = 0.45×2.5 - 0.55×1.0 = +0.575% per trade
-        rr       = 2.5
         risk_pts = abs(entry_price - stop_loss)
-        target   = round(entry_price + rr * risk_pts, 2) if is_long \
-                   else round(entry_price - rr * risk_pts, 2)
+        target   = round(entry_price + 2.5 * risk_pts, 2) if is_long \
+                   else round(entry_price - 2.5 * risk_pts, 2)
 
-        # ── Simulate holding ──────────────────────────────────────────
-        hit_target = False
-        hit_stop   = False
-        timed_out  = False
+        hit_target = hit_stop = timed_out = False
         exit_price = entry_price
         exit_date  = entry_date
-
         holding_rows = future_rows.iloc[1:HOLD_DAYS + 1]
 
         for _, (exit_ts, row) in enumerate(holding_rows.iterrows()):
-            day_high  = float(row.get("High",  row["Close"]))
-            day_low   = float(row.get("Low",   row["Close"]))
+            day_high = float(row.get("High", row["Close"]))
+            day_low  = float(row.get("Low",  row["Close"]))
 
             if is_long:
                 if day_low <= stop_loss:
@@ -385,11 +380,9 @@ def simulate_trades(
                 exit_date  = holding_rows.index[-1].date()
             timed_out = True
 
-        # ── Fix 4: Set cooldown after stop ───────────────────────────
         if hit_stop:
             cooldown_until = exit_date + timedelta(days=5)
 
-        # P&L
         if is_long:
             gross_pnl  = (exit_price - entry_price) * shares
             return_pct = (exit_price - entry_price) / entry_price * 100
@@ -397,34 +390,170 @@ def simulate_trades(
             gross_pnl  = (entry_price - exit_price) * shares
             return_pct = (entry_price - exit_price) / entry_price * 100
 
-        stt       = exit_price * shares * STT_SELL_RATE
-        brokerage = BROKERAGE_PER_TRADE * 2
-        net_pnl   = gross_pnl - stt - brokerage
+        stt      = exit_price * shares * STT_SELL_RATE
+        net_pnl  = gross_pnl - stt - BROKERAGE_PER_TRADE * 2
 
-        trades.append(TradeRecord(
-            window_id=window.window_id,
-            symbol=symbol,
-            sector=sector,
-            signal=signal.signal,
-            regime=regime,
-            strategy_id=top_strategy,
-            entry_date=entry_date,
-            exit_date=exit_date,
-            entry_price=entry_price,
-            exit_price=exit_price,
-            stop_loss=stop_loss,
-            target_price=target,
-            shares=shares,
-            gross_pnl=gross_pnl,
-            net_pnl=net_pnl,
-            return_pct=return_pct,
-            hit_target=hit_target,
-            hit_stop=hit_stop,
-            timed_out=timed_out,
-            exit_reason="TARGET" if hit_target else "STOP" if hit_stop else "TIMEOUT",
+        exit_reason = "TARGET" if hit_target else "STOP" if hit_stop else "TIMEOUT"
+
+        candidates.append(_Candidate(
+            window_id=window.window_id, symbol=symbol, sector=sector,
+            signal=signal.signal, regime=regime, strategy_id=top_strategy,
+            fused_score=signal.fused_score,
+            entry_date=entry_date, exit_date=exit_date,
+            entry_price=entry_price, exit_price=exit_price,
+            stop_loss=stop_loss, target_price=target,
+            is_long=is_long, slip=slip, shares=shares,
+            gross_pnl=gross_pnl, net_pnl=net_pnl, return_pct=return_pct,
+            hit_target=hit_target, hit_stop=hit_stop, timed_out=timed_out,
+            exit_reason=exit_reason,
         ))
 
-    return trades
+    return candidates
+
+
+def _candidate_to_record(c: _Candidate) -> TradeRecord:
+    return TradeRecord(
+        window_id=c.window_id, symbol=c.symbol, sector=c.sector,
+        signal=c.signal, regime=c.regime, strategy_id=c.strategy_id,
+        entry_date=c.entry_date, exit_date=c.exit_date,
+        entry_price=c.entry_price, exit_price=c.exit_price,
+        stop_loss=c.stop_loss, target_price=c.target_price,
+        shares=c.shares, gross_pnl=c.gross_pnl, net_pnl=c.net_pnl,
+        return_pct=c.return_pct, hit_target=c.hit_target,
+        hit_stop=c.hit_stop, timed_out=c.timed_out, exit_reason=c.exit_reason,
+    )
+
+
+# ── Constants for portfolio simulator ────────────────────────────
+MAX_SECTOR_SIGNALS_PER_DAY = 2      
+SECTOR_QUARANTINE_SESSIONS = 5      
+MAX_OPEN_POSITIONS         = settings.max_open_positions
+MAX_SECTOR_EXPOSURE        = settings.max_sector_exposure_pct
+PORTFOLIO_VALUE            = settings.portfolio_value_inr
+MAX_TOTAL_RISK_PCT         = 0.10
+
+
+class BacktestPortfolioSimulator:
+    def __init__(self, trading_dates: List[date], verbose: bool = False):
+        self.trading_dates = sorted(set(trading_dates))
+        self.verbose       = verbose
+        self._open: List[Dict] = []
+        self._sector_daily_counts: Dict[date, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self._sector_recent_exits: Dict[str, deque] = defaultdict(lambda: deque(maxlen=2))
+        self._sector_quarantine_expiry: Dict[str, Optional[date]] = {}
+
+    def _is_quarantined(self, sector: str, today: date) -> bool:
+        expiry = self._sector_quarantine_expiry.get(sector)
+        return expiry is not None and today < expiry
+
+    def _set_quarantine(self, sector: str, trigger_date: date) -> None:
+        try:
+            idx = self.trading_dates.index(trigger_date)
+        except ValueError:
+            idx = next((i for i, d in enumerate(self.trading_dates) if d >= trigger_date),
+                       len(self.trading_dates) - 1)
+        expiry_idx = min(idx + SECTOR_QUARANTINE_SESSIONS, len(self.trading_dates) - 1)
+        self._sector_quarantine_expiry[sector] = self.trading_dates[expiry_idx]
+        logger.debug(f"Sector quarantine: {sector} locked until {self._sector_quarantine_expiry[sector]}")
+
+    def _process_exits(self, today: date) -> None:
+        still_open = []
+        for pos in self._open:
+            if pos["exit_date"] <= today:
+                sector      = pos["sector"]
+                exit_reason = pos["exit_reason"]
+                self._sector_recent_exits[sector].append(exit_reason)
+
+                recent = list(self._sector_recent_exits[sector])
+                if len(recent) == 2 and all(r == "STOP" for r in recent):
+                    self._set_quarantine(sector, today)
+                    if self.verbose:
+                        logger.info(f"{today} {sector}: 2 consecutive STOPs → Quarantine initiated.")
+            else:
+                still_open.append(pos)
+        self._open = still_open
+
+    def _count_open_by_sector(self) -> Dict[str, int]:
+        counts: Dict[str, int] = defaultdict(int)
+        for pos in self._open:
+            counts[pos["sector"]] += 1
+        return counts
+
+    def run(self, candidates: List[_Candidate]) -> List[_Candidate]:
+        if not candidates:
+            return []
+
+        by_date: Dict[date, List[_Candidate]] = defaultdict(list)
+        for c in candidates:
+            by_date[c.entry_date].append(c)
+
+        accepted: List[_Candidate] = []
+        total_rejected_quarantine  = 0
+        total_rejected_daily_cap   = 0
+        total_rejected_portfolio   = 0
+
+        for today in sorted(by_date.keys()):
+            self._process_exits(today)
+            todays_candidates = by_date[today]
+            todays_candidates.sort(key=lambda c: c.fused_score, reverse=True)
+
+            open_by_sector = self._count_open_by_sector()
+            running_risk = sum(pos["risk_amount_inr"] for pos in self._open) / PORTFOLIO_VALUE
+            sector_value: Dict[str, float] = defaultdict(float)
+            for pos in self._open:
+                sector_value[pos["sector"]] += pos["position_value_inr"]
+
+            for cand in todays_candidates:
+                sector = cand.sector
+                slots_used = len(self._open) + sum(1 for a in accepted if a.entry_date == today)
+                
+                if slots_used >= MAX_OPEN_POSITIONS:
+                    total_rejected_portfolio += 1
+                    continue
+
+                if self._is_quarantined(sector, today):
+                    total_rejected_quarantine += 1
+                    continue
+
+                sector_count_today = (
+                    open_by_sector.get(sector, 0) +
+                    sum(1 for a in accepted if a.entry_date == today and a.sector == sector)
+                )
+                if sector_count_today >= MAX_SECTOR_SIGNALS_PER_DAY:
+                    total_rejected_daily_cap += 1
+                    continue
+
+                risk_per_share = abs(cand.entry_price - cand.stop_loss)
+                if risk_per_share <= 0:
+                    continue
+
+                position_value = cand.shares * cand.entry_price
+                risk_amount    = cand.shares * risk_per_share
+
+                if (sector_value[sector] + position_value) / PORTFOLIO_VALUE > MAX_SECTOR_EXPOSURE:
+                    total_rejected_portfolio += 1
+                    continue
+
+                effective_risk = risk_amount / PORTFOLIO_VALUE
+                if running_risk + effective_risk > MAX_TOTAL_RISK_PCT:
+                    total_rejected_portfolio += 1
+                    continue
+
+                running_risk         += effective_risk
+                sector_value[sector] += position_value
+                accepted.append(cand)
+
+                self._open.append({
+                    "symbol":             cand.symbol,
+                    "sector":             cand.sector,
+                    "position_value_inr": position_value,
+                    "risk_amount_inr":    risk_amount,
+                    "exit_date":          cand.exit_date,
+                    "exit_reason":        cand.exit_reason,
+                })
+
+        logger.info(f"Portfolio simulation completed. Accepted {len(accepted)} trades.")
+        return accepted
 
 
 # ── Metrics calculation ───────────────────────────────────────
@@ -437,8 +566,6 @@ def calculate_metrics(
     regime:       Optional[str] = None,
     sector:       Optional[str] = None,
 ) -> Optional[BacktestResult]:
-    """Computes all Section 12.3 metrics from a list of trades."""
-
     if not trades:
         return None
 
@@ -456,12 +583,10 @@ def calculate_metrics(
     gross_loss   = abs(sum(t.return_pct for t in losses))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-    # Annualised return
     days_in_period = (period_end - period_start).days or 1
     total_return   = float(np.sum(returns))
     ann_return     = total_return * (365 / days_in_period)
 
-    # Sharpe ratio (annualised, risk-free = 6.5% India)
     risk_free_daily = 6.5 / 252
     if len(returns) > 1:
         excess  = [r - risk_free_daily for r in returns]
@@ -469,22 +594,16 @@ def calculate_metrics(
     else:
         sharpe = 0.0
 
-    # Max drawdown — 90th percentile worst window DD
-    # Worst single window is too sensitive to one bad period;
-    # 90th pct gives a robust tail-risk view across all windows.
-    window_ids = sorted(set(t.window_id for t in trades))
-    all_dd = []
-    for wid in window_ids:
-        w_returns = [t.return_pct for t in trades if t.window_id == wid]
-        if not w_returns:
-            continue
-        eq   = np.cumsum(w_returns)
-        peak = np.maximum.accumulate(eq)
-        dd   = eq - peak
-        all_dd.append(float(abs(np.min(dd))))
-    max_dd = float(np.percentile(all_dd, 90)) if all_dd else 0.0  # 90th pct window DD
+    trades_by_exit = sorted(trades, key=lambda t: t.exit_date)
+    pnl_curve      = np.cumsum([t.net_pnl for t in trades_by_exit])
+    if len(pnl_curve) > 0:
+        equity = settings.portfolio_value_inr + pnl_curve
+        peak   = np.maximum.accumulate(equity)
+        dd_pct = (equity - peak) / peak * 100
+        max_dd = float(abs(np.min(dd_pct)))
+    else:
+        max_dd = 0.0
 
-    # Realistic versions (net of costs)
     net_total  = float(np.sum(net_ret))
     net_ann    = net_total * (365 / days_in_period)
     net_wins   = [r for r in net_ret if r > 0]
@@ -492,7 +611,6 @@ def calculate_metrics(
     net_sharpe = (np.mean(net_ret) / (np.std(net_ret) + 1e-9)) * math.sqrt(252) \
         if len(net_ret) > 1 else 0.0
 
-    # Acceptance criteria (Section 12.3)
     meets = bool(
         sharpe   >= settings.backtest_min_sharpe     and
         max_dd   <= settings.backtest_max_drawdown * 100 and
@@ -508,32 +626,18 @@ def calculate_metrics(
         notes_parts.append(f"WinRate {win_rate:.1f}%<{settings.backtest_min_win_rate*100:.0f}%")
 
     return BacktestResult(
-        strategy_id=strategy_id,
-        period_start=period_start,
-        period_end=period_end,
-        regime=regime,
-        sector=sector,
-        total_trades=len(trades),
-        winning_trades=len(wins),
-        losing_trades=len(losses),
-        win_rate_pct=round(win_rate, 2),
-        avg_return_pct=round(avg_return, 4),
-        total_return_pct=round(total_return, 2),
-        annualized_return_pct=round(ann_return, 2),
-        sharpe_ratio=round(float(sharpe), 3),
-        max_drawdown_pct=round(max_dd, 2),
-        avg_win_pct=round(avg_win, 4),
-        avg_loss_pct=round(avg_loss, 4),
-        profit_factor=round(profit_factor, 3),
-        sharpe_realistic=round(float(net_sharpe), 3),
-        win_rate_realistic=round(net_wr, 2),
-        annualized_return_realistic=round(net_ann, 2),
-        meets_acceptance_criteria=meets,
-        notes=" | ".join(notes_parts),
+        strategy_id=strategy_id, period_start=period_start, period_end=period_end,
+        regime=regime, sector=sector, total_trades=len(trades),
+        winning_trades=len(wins), losing_trades=len(losses),
+        win_rate_pct=round(win_rate, 2), avg_return_pct=round(avg_return, 4),
+        total_return_pct=round(total_return, 2), annualized_return_pct=round(ann_return, 2),
+        sharpe_ratio=round(float(sharpe), 3), max_drawdown_pct=round(max_dd, 2),
+        avg_win_pct=round(avg_win, 4), avg_loss_pct=round(avg_loss, 4),
+        profit_factor=round(profit_factor, 3), sharpe_realistic=round(float(net_sharpe), 3),
+        win_rate_realistic=round(net_wr, 2), annualized_return_realistic=round(net_ann, 2),
+        meets_acceptance_criteria=meets, notes=" | ".join(notes_parts),
     )
 
-
-# ── DB persistence ────────────────────────────────────────────
 
 def save_backtest_result(result: BacktestResult, run_id: str) -> None:
     try:
@@ -542,31 +646,28 @@ def save_backtest_result(result: BacktestResult, run_id: str) -> None:
             cur.execute(
                 """
                 INSERT INTO backtest_results (
-                    run_id, strategy_id, period_start, period_end,
-                    regime, sector,
-                    sharpe_ratio, max_drawdown_pct, win_rate_pct,
-                    annualized_return_pct, total_trades, avg_return_pct,
-                    sharpe_realistic, win_rate_realistic,
-                    annualized_return_realistic,
-                    meets_acceptance_criteria, notes
-                ) VALUES (
-                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-                )
+                    run_id, strategy_id, period_start, period_end, regime, sector,
+                    sharpe_ratio, max_drawdown_pct, win_rate_pct, annualized_return_pct,
+                    total_trades, avg_return_pct, sharpe_realistic, win_rate_realistic,
+                    annualized_return_realistic, meets_acceptance_criteria, notes
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
-                    run_id, result.strategy_id,
-                    result.period_start, result.period_end,
-                    result.regime, result.sector,
-                    result.sharpe_ratio, result.max_drawdown_pct,
-                    result.win_rate_pct, result.annualized_return_pct,
-                    result.total_trades, result.avg_return_pct,
-                    result.sharpe_realistic, result.win_rate_realistic,
-                    result.annualized_return_realistic,
-                    bool(result.meets_acceptance_criteria), result.notes,
+                    run_id, result.strategy_id, result.period_start, result.period_end,
+                    result.regime, result.sector, result.sharpe_ratio, result.max_drawdown_pct,
+                    result.win_rate_pct, result.annualized_return_pct, result.total_trades,
+                    result.avg_return_pct, result.sharpe_realistic, result.win_rate_realistic,
+                    result.annualized_return_realistic, bool(result.meets_acceptance_criteria),
+                    result.notes,
                 ),
             )
     except Exception as e:
         logger.error(f"Failed to save backtest result: {e}")
+
+
+def _make_run_id() -> str:
+    import uuid
+    return str(uuid.uuid4())
 
 
 # ── Main engine ───────────────────────────────────────────────
@@ -574,12 +675,10 @@ def save_backtest_result(result: BacktestResult, run_id: str) -> None:
 class BacktestEngine:
     """
     Orchestrates full walk-forward backtest across all stocks and windows.
-
     Usage:
         engine = BacktestEngine(stocks=["RELIANCE","TCS"], verbose=True)
         summary = engine.run()
     """
-
     def __init__(
         self,
         stocks:      Optional[List[str]] = None,
@@ -596,57 +695,54 @@ class BacktestEngine:
         self.run_id      = _make_run_id()
 
     def run(self) -> Dict:
-        """
-        Returns summary dict with:
-          all_trades, results_by_strategy, results_by_regime,
-          results_by_sector, aggregate, passes_acceptance
-        """
-        logger.info(
-            f"Backtest start | run_id={self.run_id} | stocks={len(self.stocks)} | "
-            f"train={self.train_years}y test={self.test_months}m"
-        )
+        logger.info(f"Starting backtest engine context: run_id={self.run_id}")
+        
+        all_candidates: List[_Candidate] = []
+        trading_dates_seen = set()
 
-        all_trades: List[TradeRecord] = []
-
+        # Phase 1: Per-stock walking windows and signal candidate harvesting
         for symbol in self.stocks:
-            logger.info(f"Backtesting {symbol}...")
             df = self._load_data(symbol)
             if df is None or len(df) < 210:
-                logger.warning(f"{symbol}: insufficient data, skipping")
                 continue
 
             data_start = df.index[0].date()
             data_end   = df.index[-1].date()
-            windows    = generate_windows(data_start, data_end,
-                                          self.train_years, self.test_months)
+            windows    = generate_windows(data_start, data_end, self.train_years, self.test_months)
 
             for window in windows:
-                # Detect regime for this test window using train data
                 train_df = df[df.index.date <= window.train_end]
                 regime   = self._detect_regime(train_df)
+                signals  = simulate_signals_for_window(symbol, df, window, regime)
+                
+                # Build localized asset candidates
+                candidates = _build_candidates(symbol, df, signals, window, regime)
+                for c in candidates:
+                    all_candidates.append(c)
+                    trading_dates_seen.add(c.entry_date)
+                    trading_dates_seen.add(c.exit_date)
 
-                signals = simulate_signals_for_window(symbol, df, window, regime)
-                trades  = simulate_trades(symbol, df, signals, window, regime)
-                all_trades.extend(trades)
-
-                if self.verbose and trades:
-                    wins = sum(1 for t in trades if t.return_pct > 0)
-                    logger.info(
-                        f"  {window} | {symbol} | "
-                        f"{len(trades)} trades | {wins} wins | regime={regime}"
-                    )
-
-        if not all_trades:
-            logger.warning("No trades generated — insufficient data or signals")
+        if not all_candidates:
             return {"all_trades": [], "aggregate": None, "passes_acceptance": False}
 
-        # ── Aggregate metrics ─────────────────────────────────
+        # Phase 2: Multi-asset cross-sectional portfolio tracking simulation
+        simulator = BacktestPortfolioSimulator(list(trading_dates_seen), verbose=self.verbose)
+        accepted_candidates = simulator.run(all_candidates)
+
+        # Convert back to regular TradeRecords
+        all_trades = [_candidate_to_record(c) for c in accepted_candidates]
+        if not all_trades:
+            return {"all_trades": [], "aggregate": None, "passes_acceptance": False}
+
         period_start = min(t.entry_date for t in all_trades)
-        period_end   = max(t.exit_date  for t in all_trades)
+        period_end   = max(t.exit_date for t in all_trades)
 
+        # Compute combined portfolio aggregates
         aggregate = calculate_metrics(all_trades, "combined", period_start, period_end)
+        if aggregate and self.save_to_db:
+            save_backtest_result(aggregate, self.run_id)
 
-        # ── Per-strategy segmentation (Section 26.1) ──────────
+        # Segmented breakdowns: Strategy
         results_by_strategy: Dict[str, BacktestResult] = {}
         for sid in set(t.strategy_id for t in all_trades):
             seg_trades = [t for t in all_trades if t.strategy_id == sid]
@@ -656,65 +752,48 @@ class BacktestEngine:
                 if self.save_to_db:
                     save_backtest_result(r, self.run_id)
 
-        # ── Per-regime segmentation ───────────────────────────
+        # Segmented breakdowns: Regime
         results_by_regime: Dict[str, BacktestResult] = {}
         for reg in set(t.regime for t in all_trades):
             seg_trades = [t for t in all_trades if t.regime == reg]
-            r = calculate_metrics(seg_trades, "combined", period_start, period_end,
-                                  regime=reg)
+            r = calculate_metrics(seg_trades, "combined", period_start, period_end, regime=reg)
             if r:
                 results_by_regime[reg] = r
                 if self.save_to_db:
                     save_backtest_result(r, self.run_id)
 
-        # ── Per-sector segmentation ───────────────────────────
+        # Segmented breakdowns: Sector
         results_by_sector: Dict[str, BacktestResult] = {}
         for sec in set(t.sector for t in all_trades):
             seg_trades = [t for t in all_trades if t.sector == sec]
-            r = calculate_metrics(seg_trades, "combined", period_start, period_end,
-                                  sector=sec)
+            r = calculate_metrics(seg_trades, "combined", period_start, period_end, sector=sec)
             if r:
                 results_by_sector[sec] = r
                 if self.save_to_db:
                     save_backtest_result(r, self.run_id)
 
-        # ── Save aggregate ────────────────────────────────────
-        if aggregate and self.save_to_db:
-            save_backtest_result(aggregate, self.run_id)
-
-        passes = aggregate.meets_acceptance_criteria if aggregate else False
-
-        logger.info(
-            f"Backtest complete | {len(all_trades)} trades | "
-            f"aggregate: {aggregate.summary() if aggregate else 'N/A'}"
-        )
-
         return {
-            "run_id":               self.run_id,
-            "all_trades":           all_trades,
-            "aggregate":            aggregate,
-            "results_by_strategy":  results_by_strategy,
-            "results_by_regime":    results_by_regime,
-            "results_by_sector":    results_by_sector,
-            "passes_acceptance":    passes,
+            "run_id":              self.run_id,
+            "all_trades":          all_trades,
+            "aggregate":           aggregate,
+            "results_by_strategy": results_by_strategy,
+            "results_by_regime":   results_by_regime,
+            "results_by_sector":   results_by_sector,
+            "passes_acceptance":   aggregate.meets_acceptance_criteria if aggregate else False,
         }
 
     def _load_data(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Load OHLCV from DB and build DataFrame."""
         try:
             from app.data.validator import get_latest_ohlcv
             rows = get_latest_ohlcv(symbol, n=2000)
             if len(rows) < 210:
                 return None
-            df = build_dataframe(rows)
-            # Add Open/High/Low if not present (build_dataframe uses Close/Volume)
-            return df
+            return build_dataframe(rows)
         except Exception as e:
             logger.error(f"Failed to load data for {symbol}: {e}")
             return None
 
     def _detect_regime(self, train_df: pd.DataFrame) -> str:
-        """Detect regime from training period data."""
         try:
             import pandas_ta as ta
             if len(train_df) < 210:
@@ -731,8 +810,3 @@ class BacktestEngine:
             return regime
         except Exception:
             return "UNCERTAIN"
-
-
-def _make_run_id() -> str:
-    import uuid
-    return str(uuid.uuid4())
