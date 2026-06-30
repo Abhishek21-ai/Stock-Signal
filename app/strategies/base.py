@@ -35,11 +35,14 @@ class StrategyResult:
         }
 
 
+# In app/strategies/base.py -> Replace score_to_signal function
+
 def score_to_signal(score: float) -> str:
-    if score >= 60:   return "STRONG_BUY"
-    if score >= 25:   return "BUY"
-    if score <= -60:  return "STRONG_SELL"
-    if score <= -25:  return "SELL"
+    # Lowered thresholds slightly to account for regime/trend scaling compression
+    if score >= 50:   return "STRONG_BUY"
+    if score >= 20:   return "BUY"          # Lowered from 25
+    if score <= -50:  return "STRONG_SELL"
+    if score <= -20:  return "SELL"         # Raised from -25
     return "HOLD"
 
 

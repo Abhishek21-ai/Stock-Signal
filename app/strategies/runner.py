@@ -1,5 +1,5 @@
 """
-Strategy Runner — executes all 6 strategies and returns results.
+Strategy Runner — executes all 5 core strategies and returns results.
 Called by pipeline.py Stage 4.
 """
 from __future__ import annotations
@@ -12,18 +12,18 @@ from app.strategies.momentum import MomentumStrategy
 from app.strategies.reversion import MeanReversionStrategy
 from app.strategies.breakout import BreakoutStrategy
 from app.strategies.volume import VolumeProfileStrategy
-from app.strategies.risk import RiskStrategy
+# Removed RiskStrategy from direct generation import
 from app.logger import get_logger
 
 logger = get_logger("strategy_runner")
 
+# Only keep true alpha-generating strategies here
 ALL_STRATEGIES = [
     TrendFollowingStrategy(),
     MomentumStrategy(),
     MeanReversionStrategy(),
     BreakoutStrategy(),
     VolumeProfileStrategy(),
-    RiskStrategy(),
 ]
 
 
@@ -33,7 +33,9 @@ class StrategyRunner:
         for strategy in ALL_STRATEGIES:
             try:
                 result = strategy.run(features, regime=regime)
-                results.append(result)
+                # Ensure we only track actual trade signals
+                if result:
+                    results.append(result)
             except Exception as e:
                 logger.error(
                     f"Strategy {strategy.strategy_id} failed for "

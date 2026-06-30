@@ -1,22 +1,12 @@
 """
-Strategy 3: Mean Reversion — Section 8.3
-Logic: Bollinger Band extremes + RSI extremes + distance from EMA
-
-Best in SIDEWAYS/UNCERTAIN regime. Suppressed in strong trends.
-
-Regime weights:
-  SIDEWAYS:  weight=1.4  (reversion thrives here)
-  UNCERTAIN: weight=1.1
-  BULL:      weight=0.6  (don't fade bull trends)
-  BEAR:      weight=0.6
+Strategy 3: Mean Reversion — Optimized Edition
 """
 from __future__ import annotations
 
 from typing import Dict
-
 from app.strategies.base import BaseStrategy, StrategyResult, score_to_signal
 
-REGIME_WEIGHTS = {"BULL": 0.6, "BEAR": 0.6, "SIDEWAYS": 1.4, "UNCERTAIN": 1.1}
+REGIME_WEIGHTS = {"BULL": 0.7, "BEAR": 0.7, "SIDEWAYS": 1.5, "UNCERTAIN": 1.2}
 
 
 class MeanReversionStrategy(BaseStrategy):
@@ -27,93 +17,74 @@ class MeanReversionStrategy(BaseStrategy):
         reasons = []
         close = features.get("close", 0)
 
-        # ── 1. Bollinger Band position (max ±50 pts) ──────────
+        # ── 1. Bollinger Band position (Slightly boosted base scores) ──
         bb_pct_b = features.get("bb_pct_b", 0.5) or 0.5
-        bb_lower = features.get("bb_lower", close)
-        bb_upper = features.get("bb_upper", close)
-        bb_mid   = features.get("bb_mid",   close)
 
-        if bb_pct_b < 0.05:          # price at/below lower band
-            score += 50
-            reasons.append(f"Price at lower Bollinger Band (%B={bb_pct_b:.2f}) — reversion setup")
+        if bb_pct_b < 0.05:
+            score += 60  # Boosted from 50
+            reasons.append(f"Price outside lower Bollinger Band (%B={bb_pct_b:.2f})")
         elif bb_pct_b < 0.20:
-            score += 30
+            score += 35  # Boosted from 30
             reasons.append(f"Price near lower BB (%B={bb_pct_b:.2f})")
-        elif bb_pct_b > 0.95:        # price at/above upper band
-            score -= 45
-            reasons.append(f"Price at upper Bollinger Band (%B={bb_pct_b:.2f}) — overbought")
+        elif bb_pct_b > 0.95:
+            score -= 55  # Boosted from -45
+            reasons.append(f"Price outside upper Bollinger Band (%B={bb_pct_b:.2f})")
         elif bb_pct_b > 0.80:
-            score -= 25
+            score -= 30
             reasons.append(f"Price near upper BB (%B={bb_pct_b:.2f})")
-        else:
-            reasons.append(f"Price mid-band (%B={bb_pct_b:.2f}) — no reversion signal")
 
-        # Band width: narrow bands = volatility squeeze = breakout coming, not reversion
+        # Band width check
         bb_width = features.get("bb_width", 0.1) or 0.1
         if bb_width < 0.03:
-            score *= 0.5
-            reasons.append(f"BB squeeze detected (width={bb_width:.3f}) — breakout likely, reducing reversion score")
+            score *= 0.4  # Slightly more restrictive on tight squeezes
+            reasons.append(f"BB squeeze ({bb_width:.3f}) — avoiding breakout")
 
-        # ── 2. Distance from EMA50 (max ±25 pts) ─────────────
+        # ── 2. Distance from EMA50 ───────────────────────────
         ema_50 = features.get("ema_50", close)
         if ema_50 and ema_50 > 0:
             dev_pct = (close - ema_50) / ema_50
+            if dev_pct < -0.04:
+                score += 25
+                reasons.append(f"Price deep deviation below EMA50 ({dev_pct:.1%})")
+            elif dev_pct > 0.04:
+                score -= 25
 
-            if dev_pct < -0.05:      # >5% below EMA50
-                score += 20
-                reasons.append(f"Price {dev_pct:.1%} below EMA50 — oversold vs mean")
-            elif dev_pct < -0.03:
-                score += 10
-                reasons.append(f"Price {dev_pct:.1%} below EMA50")
-            elif dev_pct > 0.05:     # >5% above EMA50
-                score -= 20
-                reasons.append(f"Price {dev_pct:.1%} above EMA50 — extended")
-            elif dev_pct > 0.03:
-                score -= 10
-                reasons.append(f"Price {dev_pct:.1%} above EMA50")
-
-        # ── 3. RSI confirmation (max ±20 pts) ─────────────────
+        # ── 3. RSI confirmation ───────────────────────────────
         rsi = features.get("rsi_14", 50)
         if rsi < 35:
             score += 20
-            reasons.append(f"RSI confirms oversold at {rsi:.1f}")
-        elif rsi < 45:
-            score += 8
-            reasons.append(f"RSI weak at {rsi:.1f} supports reversion buy")
         elif rsi > 65:
             score -= 20
-            reasons.append(f"RSI confirms overbought at {rsi:.1f}")
-        elif rsi > 55:
-            score -= 8
-            reasons.append(f"RSI elevated at {rsi:.1f}")
 
-        # ── 4. Suppress if strong trend (ADX check) ──────────
+        # ── 4. Suppress if strong trend (Loosened penalty slightly) ──
         adx = features.get("adx_14", 0)
-        if adx > 30:
-            score *= 0.4
-            reasons.append(f"Strong trend ADX={adx:.1f} — suppressing reversion signal")
-        elif adx > 25:
-            score *= 0.7
-            reasons.append(f"Moderate trend ADX={adx:.1f} — reducing reversion confidence")
+        if adx > 32:
+            score *= 0.5
+            reasons.append(f"ADX extreme trend ({adx:.1f}) — throttling reversion")
 
-        # ── 5. Regime weight ──────────────────────────────────
-        weight = REGIME_WEIGHTS.get(regime, 1.1)
+        # ── 5. Regime weight and execution boundaries ────────
+        weight = REGIME_WEIGHTS.get(regime, 1.2)
         score  = max(-100, min(100, score * weight))
 
         atr    = features.get("atr_14", close * 0.02)
         entry  = close
-        # Reversion target = EMA50 (mean)
-        target = round(float(ema_50), 2) if ema_50 else round(close + 2 * atr, 2)
         stop   = features.get("atr_stop_15x", close - 1.5 * atr)
+        
+        # FIX: Ensure your profit target preserves a positive risk/reward ratio
+        min_take_profit = close + (1.5 * atr) # Match risk 1:1 minimum
+        if ema_50 and ema_50 > min_take_profit:
+            target = float(ema_50)
+        else:
+            target = min_take_profit
 
         return StrategyResult(
             strategy_id=self.strategy_id,
-            score=score,
+            score=round(score, 2),
             signal=score_to_signal(score),
             confidence=min(100, abs(score)),
             reasons=reasons,
-            entry_price=entry,
-            stop_loss=stop,
-            target_price=target,
-            meta={"regime_weight": weight, "bb_pct_b": bb_pct_b, "adx": adx},
+            entry_price=round(entry, 2),
+            stop_loss=round(stop, 2),
+            target_price=round(target, 2),
+            meta={"regime_weight": weight},
         )
