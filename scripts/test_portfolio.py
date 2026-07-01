@@ -19,8 +19,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import date
 from app.fusion.engine import FusedSignal
-from app.portfolio.manager import (
-    PortfolioManager, calculate_position_size,
+from app.portfolio.manager import PortfolioManager
+from app.portfolio.acceptance import (
+    calculate_position_size,
     PORTFOLIO_VALUE, RISK_PER_TRADE_PCT, MAX_SECTOR_EXPOSURE,
     MAX_TOTAL_RISK_PCT, MAX_OPEN_POSITIONS,
 )
@@ -50,7 +51,8 @@ def test_position_sizing():
 
     # Normal case — risk-based should be binding
     ps = calculate_position_size("RELIANCE", entry_price=1332.0,
-                                  stop_loss=1293.0, features=make_features(500_000))
+                                  stop_loss=1293.0, portfolio_value=PORTFOLIO_VALUE,
+                                  adv_estimate=500_000 * 1332.0)
     risk_budget = PORTFOLIO_VALUE * RISK_PER_TRADE_PCT
     expected_risk_shares = int(risk_budget / abs(1332 - 1293))
     print(f"  Portfolio: ₹{PORTFOLIO_VALUE:,.0f} | Risk/trade: {RISK_PER_TRADE_PCT:.1%}")
@@ -73,8 +75,8 @@ def test_adv_cap_binding():
     # stock_cap   = 1000000*0.15/500 = 300
     # adv_cap     = 5000*500*0.05/500 = 250  <- binds
     ps = calculate_position_size("SMALLCAP", entry_price=500.0,
-                                  stop_loss=480.0,
-                                  features={"volume_sma_20": 5_000, "close": 500.0})
+                                  stop_loss=480.0, portfolio_value=PORTFOLIO_VALUE,
+                                  adv_estimate=5_000 * 500.0)
     print(f"  Risk-based shares:  {ps.shares_risk_based}")
     print(f"  Stock-capped shares:{ps.shares_stock_capped}")
     print(f"  ADV-capped shares:  {ps.shares_adv_capped}")
