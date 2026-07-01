@@ -92,9 +92,14 @@ class BreakoutStrategy(BaseStrategy):
 
         atr    = features.get("atr_14", close * 0.02)
         entry  = close
-        # Breakout stop: just below the breakout level (2x ATR buffer)
-        stop   = features.get("atr_stop_2x", close - 2 * atr)
-        target = features.get("atr_target_3x", close + 3 * atr)
+        
+        # Use direction-appropriate stop/target
+        if score >= 0:  # BUY signal — breakout upward
+            stop   = features.get("atr_stop_2x", close - 2 * atr)
+            target = features.get("atr_target_3x", close + 3 * atr)
+        else:  # SELL signal — intraday short
+            stop   = round(close + max(1.0 * atr, 1.0), 2)
+            target = round(close - max(0.5 * atr, 1.0), 2)
 
         return StrategyResult(
             strategy_id=self.strategy_id,

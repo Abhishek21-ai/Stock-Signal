@@ -4,12 +4,6 @@ Logic: OBV trend + volume ratio + VWAP position + accumulation/distribution cand
 
 Volume is a leading indicator — smart money leaves footprints.
 Works across all regimes.
-
-Regime weights:
-  BULL:      weight=0.8
-  BEAR:      weight=0.8
-  SIDEWAYS:  weight=1.0
-  UNCERTAIN: weight=0.8
 """
 from __future__ import annotations
 
@@ -19,10 +13,10 @@ from app.strategies.base import BaseStrategy, StrategyResult, score_to_signal
 
 REGIME_WEIGHTS = {"BULL": 0.8, "BEAR": 0.8, "SIDEWAYS": 1.0, "UNCERTAIN": 0.8}
 REGIME_GATES = {
-    "BULL": 50,
-    "UNCERTAIN": 40,
+    "BULL": 40,        # Lowered slightly from 50 to allow valid entries
+    "UNCERTAIN": 35,   # Lowered from 40
     "SIDEWAYS": 0,
-    "BEAR": 50,
+    "BEAR": 40,
 }
 
 
@@ -43,21 +37,21 @@ class VolumeProfileStrategy(BaseStrategy):
             score -= 25
             reasons.append("OBV trending down — distribution phase")
 
-        # ── 2. Volume & Price Action (Fix for the falling knife) ──
+        # ── 2. Volume & Price Action ───────────────────────────
         vol_ratio = features.get("volume_ratio", 1.0)
         high = features.get("high", close)
         low = features.get("low", close)
 
-        # Calculate candle shape: 1.0 means closed at absolute high, 0.0 means absolute low
+        # Calculate candle shape
         candle_range = high - low
         close_strength = (close - low) / candle_range if candle_range > 0 else 0.5
 
         if vol_ratio > 1.5:
             if close_strength > 0.7:
-                score += 30
+                score += 35  # Increased weight slightly
                 reasons.append(f"High volume ({vol_ratio:.1f}x) and strong close — accumulation")
             elif close_strength < 0.3:
-                score -= 40
+                score -= 35  # Balanced out distribution penalty
                 reasons.append(f"High volume ({vol_ratio:.1f}x) but weak close — heavy distribution")
             else:
                 score -= 10
@@ -77,9 +71,9 @@ class VolumeProfileStrategy(BaseStrategy):
 
         # ── 4. Overbought Exhaustion Filter ───────────────────
         rsi = features.get("rsi_14", 50)
-        if rsi > 70 and score > 0:
-            score *= 0.1
-            reasons.append(f"Volume spike but RSI is extremely overbought ({rsi:.1f}) — avoiding blow-off top")
+        if rsi > 75 and score > 0:  # Loosened restriction from 70 to 75
+            score *= 0.3            # Softened the penalty from 0.1 to 0.3
+            reasons.append(f"Volume spike but RSI is overbought ({rsi:.1f}) — caution on top")
         elif rsi < 35 and vol_ratio > 1.5 and close_strength > 0.7:
             score += 30
             reasons.append(f"Strong capitulation/reversal at oversold RSI ({rsi:.1f})")
@@ -90,19 +84,26 @@ class VolumeProfileStrategy(BaseStrategy):
 
         atr    = features.get("atr_14", close * 0.02)
         entry  = close
-        stop   = features.get("atr_stop_1x", close - atr)
-        target = features.get("atr_target_2x", close + 2 * atr)
+
+        # Use direction-appropriate stop/target
+        if score >= 0:  # BUY signal
+            stop   = features.get("atr_stop_1x", close - atr)
+            target = features.get("atr_target_2x", close + 2 * atr)
+        else:  # SELL signal — intraday short
+            stop   = round(close + max(1.0 * atr, 1.0), 2)
+            target = round(close - max(0.5 * atr, 1.0), 2)
 
         gate = REGIME_GATES.get(regime, 0)
 
-        if score > 0 and score < gate:
+        # FIX: Validate absolute conviction value against the gate threshold for both directions
+        if abs(score) < gate:
             return StrategyResult(
                 strategy_id=self.strategy_id,
                 score=0.0,
                 signal="HOLD",
                 confidence=0.0,
                 reasons=reasons + [
-                    f"Regime gate: bullish conviction {score:.1f} < {gate}"
+                    f"Regime gate: Absolute conviction {abs(score):.1f} < {gate}"
                 ],
                 entry_price=round(entry, 2),
                 stop_loss=round(stop, 2),

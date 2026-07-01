@@ -232,11 +232,19 @@ def extract_latest_features(df: pd.DataFrame, symbol: str) -> Dict:
         "pct_from_52w_low":  _safe(latest, "pct_from_52w_low"),
 
         # ── ATR-based price levels (for signal generation) ───
+        # BUY direction (long): stop below entry, target above entry
         "atr_stop_1x":  round(float(latest["Close"]) - float(_safe(latest, "atr_14", 0)), 2),
         "atr_stop_15x": round(float(latest["Close"]) - 1.5 * float(_safe(latest, "atr_14", 0)), 2),
         "atr_stop_2x":  round(float(latest["Close"]) - 2.0 * float(_safe(latest, "atr_14", 0)), 2),
         "atr_target_2x": round(float(latest["Close"]) + 2.0 * float(_safe(latest, "atr_14", 0)), 2),
         "atr_target_3x": round(float(latest["Close"]) + 3.0 * float(_safe(latest, "atr_14", 0)), 2),
+
+        # SELL direction (short): stop above entry, target below entry
+        "atr_stop_1x_sell":   round(float(latest["Close"]) + float(_safe(latest, "atr_14", 0)), 2),
+        "atr_stop_15x_sell":  round(float(latest["Close"]) + 1.5 * float(_safe(latest, "atr_14", 0)), 2),
+        "atr_stop_2x_sell":   round(float(latest["Close"]) + 2.0 * float(_safe(latest, "atr_14", 0)), 2),
+        "atr_target_2x_sell": round(float(latest["Close"]) - 2.0 * float(_safe(latest, "atr_14", 0)), 2),
+        "atr_target_3x_sell": round(float(latest["Close"]) - 3.0 * float(_safe(latest, "atr_14", 0)), 2),
     }
 
 

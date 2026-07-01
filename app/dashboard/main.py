@@ -243,9 +243,15 @@ if page == "Today's Signals":
         "valid_until",
         "created_at",
     ]
-
-    filtered = filtered[display_cols]
-
+    filtered = filtered[display_cols].rename(columns={
+        "entry_price_theoretical": "entry_price",
+        "exit_target_theoretical": "profit_target",   # ← renamed: where you'd take profit
+        "stop_loss_theoretical":   "stop_loss",
+        "confidence_pct":          "confidence_%",
+    })
+    # Note for SELL/STRONG_SELL signals:
+    #   profit_target < entry_price  (profit when stock falls)
+    #   stop_loss     > entry_price  (protection if stock rises)
 # TRIAL BLOCK ends here
 
     st.dataframe(filtered, use_container_width=True)

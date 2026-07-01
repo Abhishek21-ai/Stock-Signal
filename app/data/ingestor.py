@@ -45,6 +45,35 @@ def from_nse_ticker(ticker: str) -> str:
     return ticker.replace(NSE_SUFFIX, "")
 
 
+def _normalize_ohlcv_dataframe(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Normalize yfinance OHLCV output to a standard flat column layout."""
+    if df is None or getattr(df, "empty", True):
+        return df
+
+    normalized = df.copy()
+    if isinstance(normalized.columns, pd.MultiIndex):
+        flattened = []
+        known_fields = {"open", "high", "low", "close", "adj close", "volume", "dividends", "stock splits"}
+        for col in normalized.columns:
+            if isinstance(col, tuple):
+                candidate = None
+                for part in col:
+                    if isinstance(part, str) and part.strip().lower() in known_fields:
+                        candidate = part
+                        break
+                flattened.append(candidate or col[-1])
+            else:
+                flattened.append(col)
+        normalized.columns = flattened
+
+    if "Adj Close" in normalized.columns and "Close" not in normalized.columns:
+        normalized = normalized.rename(columns={"Adj Close": "Close"})
+    if "Adj Close" in normalized.columns and "Close" in normalized.columns:
+        normalized = normalized.drop(columns=["Adj Close"])
+
+    return normalized
+
+
 # ── Core fetch ────────────────────────────────────────────────
 
 @retry(
@@ -63,7 +92,7 @@ def _fetch_yfinance(
     """
     stock = yf.Ticker(ticker)
     df = stock.history(period=period, interval=interval, auto_adjust=True)
-    return df
+    return _normalize_ohlcv_dataframe(df)
 
 
 def _fetch_batch(
@@ -94,13 +123,13 @@ def _fetch_batch(
         # yfinance returns flat df for single ticker
         symbol = tickers[0]
         if not raw.empty:
-            result[symbol] = raw
+            result[symbol] = _normalize_ohlcv_dataframe(raw)
     else:
         for ticker, symbol in zip(nse_tickers, tickers):
             try:
                 df = raw[ticker].dropna(how="all")
                 if not df.empty:
-                    result[symbol] = df
+                    result[symbol] = _normalize_ohlcv_dataframe(df)
             except KeyError:
                 logger.warning(f"No data returned for {symbol}")
 
@@ -119,6 +148,8 @@ def validate_sla(symbol: str, df: pd.DataFrame, fetch_date: date) -> List[str]:
     Returns list of violation messages (empty = pass).
     """
     violations = []
+
+    df = _normalize_ohlcv_dataframe(df)
 
     if df is None or df.empty:
         violations.append(f"{symbol}: No data returned")
@@ -163,6 +194,8 @@ def upsert_market_data(symbol: str, df: pd.DataFrame, source: str = "YFINANCE") 
     Upserts OHLCV rows into market_data table.
     Returns count of rows inserted/updated.
     """
+    df = _normalize_ohlcv_dataframe(df)
+
     if df is None or df.empty:
         return 0
 

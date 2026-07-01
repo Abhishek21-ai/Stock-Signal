@@ -122,6 +122,28 @@ def test_all_hold():
     print(f"  ✅ All HOLD: score={fs.fused_score:.1f} → {fs.signal}")
 
 
+def test_short_signal_levels_are_intraday():
+    print("\n── Test 5b: Short signal levels ─────────────────────")
+    results = [
+        make_result("trend", score=-80.0, confidence=75.0, entry=614.0, stop=588.0, target=580.0),
+    ]
+    fs = fuse(
+        "ITC",
+        results,
+        uncertain_regime(),
+        run_date=date.today(),
+        features={"close": 614.0, "atr_14": 8.0},
+        save_to_db=False,
+    )
+    assert fs.stop_loss is not None and fs.stop_loss > fs.entry_price, (
+        f"Expected stop above entry for short signal, got stop={fs.stop_loss} entry={fs.entry_price}"
+    )
+    assert fs.target_price is not None and fs.target_price < fs.entry_price, (
+        f"Expected target below entry for short signal, got target={fs.target_price} entry={fs.entry_price}"
+    )
+    print(f"  ✅ Short signal levels corrected: entry={fs.entry_price} target={fs.target_price} stop={fs.stop_loss}")
+
+
 def test_batch_fusion():
     print("\n── Test 6: Batch FusionEngine ───────────────────────")
     regime = bull_regime()
@@ -165,6 +187,7 @@ def main():
     test_disagreement_penalty()
     test_confidence_gate()
     test_all_hold()
+    test_short_signal_levels_are_intraday()
     test_batch_fusion()
     test_db_save()
 

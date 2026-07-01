@@ -119,7 +119,13 @@ class RiskStrategy(BaseStrategy):
                 reasons.append(f"Valid stop: {stop_pct:.1f}% below entry")
 
         # ── Check 5: Risk/Reward ratio ────────────────────────
-        target = features.get("atr_target_3x", close + 3.0 * atr)
+        # Use direction-appropriate target
+        if score >= 0:  # BUY signal
+            target = features.get("atr_target_3x", close + 3.0 * atr)
+        else:  # SELL signal — intraday short
+            target = round(close - max(0.5 * atr, 1.0), 2)
+            stop   = round(close + max(1.0 * atr, 1.0), 2)
+        
         risk   = abs(close - stop)   if close > stop  else atr
         reward = abs(target - close) if target > close else atr * 2
 

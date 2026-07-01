@@ -180,8 +180,28 @@ def fuse(
     if features:
         close = features.get("close")
         if not entry:  entry  = close
-        if not stop:   stop   = features.get("atr_stop_15x")
-        if not target: target = features.get("atr_target_2x")
+        if direction > 0:   # BUY — stop below entry, target above
+            if not stop:   stop   = features.get("atr_stop_15x")
+            if not target or target <= entry:
+                target = features.get("atr_target_2x")
+                if target and target <= entry:
+                    reasons.append(
+                        f"BUY target validation: adjusted to ATR-based target above entry"
+                    )
+        else:              # SELL — intraday short: stop above entry, target below
+            if not stop:   stop   = features.get("atr_stop_15x_sell")
+            if not target or target >= entry:
+                target = features.get("atr_target_2x_sell")
+                if target and target >= entry:
+                    reasons.append(
+                        f"SELL target validation: adjusted to ATR-based target below entry"
+                    )
+            if not stop or stop <= entry:
+                stop = features.get("atr_stop_15x_sell") or (close + 1.5 * (features.get("atr_14") or 0))
+                if stop and stop <= entry:
+                    reasons.append(
+                        f"SELL stop validation: adjusted to ATR-based stop above entry"
+                    )
 
     # ── 6. Top reasons from strategies ───────────────────────
     for r in eligible:
@@ -262,6 +282,9 @@ def _save_to_db(fs: FusedSignal) -> None:
                     reversion_score=EXCLUDED.reversion_score,
                     breakout_score=EXCLUDED.breakout_score,
                     volume_score=EXCLUDED.volume_score,
+                    entry_price_theoretical=EXCLUDED.entry_price_theoretical,
+                    stop_loss_theoretical=EXCLUDED.stop_loss_theoretical,
+                    exit_target_theoretical=EXCLUDED.exit_target_theoretical,
                     regime=EXCLUDED.regime
                 """,
                 (

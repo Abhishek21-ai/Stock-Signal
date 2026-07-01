@@ -104,8 +104,14 @@ class TrendFollowingStrategy(BaseStrategy):
         # ── Entry / Stop / Target ─────────────────────────────
         atr = features.get("atr_14", close * 0.02)
         entry  = close
-        stop   = features.get("atr_stop_15x", close - 1.5 * atr)
-        target = features.get("atr_target_3x", close + 3.0 * atr)
+        
+        # Use direction-appropriate stop/target
+        if score >= 0:  # BUY signal
+            stop   = features.get("atr_stop_15x", close - 1.5 * atr)
+            target = features.get("atr_target_3x", close + 3.0 * atr)
+        else:  # SELL signal — intraday short
+            stop   = round(close + max(1.0 * atr, 1.0), 2)
+            target = round(close - max(0.5 * atr, 1.0), 2)
 
         return StrategyResult(
             strategy_id=self.strategy_id,
